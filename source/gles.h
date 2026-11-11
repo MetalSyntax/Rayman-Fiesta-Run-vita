@@ -1,21 +1,14 @@
-/**
- * @file gles.h
- * @brief OpenGL ES 1.1 / 2.0 graphics pipeline over vitaGL with SoftFP calling convention.
- */
 #pragma once
 #include <stdint.h>
 
-/**
- * @brief Initializes the OpenGL ES pipeline and off-screen virtual FBO.
- */
+extern int fb_w, fb_h; // tamaño del drawable de iOS (renderbuffer de la CAEAGLLayer)
+extern float fb_scale;  // píxeles del drawable por punto de UIKit (contentScaleFactor)
 void gles_init(void);
-
-/**
- * @brief Presents current frame: blits and scales iOS FBO to PS Vita 960x544 screen.
- */
+void gles_set_size(int w, int h);
+void gles_drawable_storage(int w, int h); // renderbufferStorage:fromDrawable:
 void gles_present(void);
-
-/**
- * @brief Returns the total number of draw calls dispatched this session.
- */
+void gles_bind_screen(void);                // GLKView bindDrawable                   // presentRenderbuffer:
+int gles_rotation(void);                   // 0 sin girar, 1 landscape-right, 2 landscape-left
+void gles_dest_rect(int *x, int *y, int *w, int *h);
 uint32_t gles_get_draw_calls(void);
+int ime_active(void);

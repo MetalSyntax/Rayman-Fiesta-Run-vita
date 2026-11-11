@@ -1,77 +1,74 @@
-# Rayman Fiesta Run — Progreso del Port (iOS Mach-O)
+# Rayman Fiesta Run — Progreso del port (iOS → PS Vita)
 
+## 2026-11-04 — Inicialización y runtime completo (todo offline; falta solo probar en consola)
 
-### Phase 1: Repo and tools
-- [x] IPA extracted, `game_app` symlink, ios-loader-boilerplate merged, CMake/`hle.h` adapted to `raymanfiesta`.
-- [x] Executable decrypted (cryptid 0).
-- [x] `rebase.bin` + `docs/macho_report.txt` generated (`python3 -I tools/macho_prep.py game_app/rfr_dev ux0_data/raymanfiesta/rebase.bin --report docs/macho_report.txt`).
+### Hecho
+- `psvita-toolkit init --ipa "IPA/Rayman_Fiesta_Run_1.2.3.ipa" --name "Rayman Fiesta Run" --titleid PSVRFR001 --slug raymanfiesta --vita-ip 192.168.3.15` (commit del scaffold).
+- Binario `rfr_dev`: armv7/armv7s PIE (Thumb-2), se usa armv7, cryptid 0 (descifrado). MinimumOSVersion 5.0.
+- Motor: Pasta Games "ITF"/UbiArt-lite: la misma familia de motor que Rayman-Jungle-Run-vita (Android, soloader, ya jugable) → referencia de ciclo de vida y assets (`casa_gamedata/`). GLES1 (+ algunas llamadas GLES2), sqlite, GameKit/StoreKit/Social (stubs), PLCrashReporter (stubs Mach).
+- Arranque: Sin MainWindow: `main` (encontrado desde `start`, binario sin símbolos) → `UIApplicationMain` → delegate crea `GameViewController` (subclase de **GLKViewController**) con `initWithNibName:@"GameViewController_iPhone5"` → nib con **GLKView** (precompilado en `nibs/`).
+- **El boilerplate iOS que copia el toolkit no compila ni tiene runtime ObjC** → se reemplazó por el loader probado de Inotia2-vita + un runtime nuevo y común a los 6 ports iOS (copia maestra en `Ferrari-GT-Evolution-vita/source`, se sincroniza con `tools/sync_runtime.sh <port>`). Detalle en `PORTING_PLAN.md` §1.
+- `tools/ios_prep.py` → `rebase.bin` **62150** palabras, `binds.bin` **6388** slots / 862 símbolos. Modo: PIE/dyld_info (exacto); 10 binds resueltos dentro de la imagen.
+  - El clasificador se validó contra HAWX (que trae símbolos): 0 punteros perdidos, 0 falsos positivos en datos.
+- Cobertura de imports: todos resuelven (implementación, clase vacía autogenerada, NSString constante sintetizada o stub `unimpl` que lo registra en el log).
+- C++: `tools/gen_cxx.py` mapea la libstdc++ de iOS (ABI COW) a la de VitaSDK (`source/cxx_imports.c`).
+- Audio: OpenAL + `ExtAudioFile` (wav/mp3 → `.ogg`); `AVAudioPlayer` (clase vacía).
+- Video: Sin videos.
+- Controles: Runner de 1-2 botones táctiles (saltar/golpear) → `controls.txt`.
+- Rotación del drawable: 0 (la GLKView del nib ya es 568x320 apaisada).
+- Build OK: `psvita-toolkit build --preset debug` → `build/raymanfiesta.vpk`.
+- Datos preparados: `tools/stage_data.sh` → `ux0_data/raymanfiesta/` (bundle, `rebase.bin`, `binds.bin`, `controls.txt`, música `.ogg`).
 
-### Phase 2: Decompilation and inventory
-- [x] `decompiled/macho/` dumps (frameworks, ObjC classes, symbols, imports) -- section 2.
-- [ ] Ghidra pseudo-C of `rfr_dev` (optional but needed for crash triage).
-- [ ] Classify `imports.txt` into: libc/math/pthread (map to newlib/darwin.c), GL (map to vitaGL), ObjC/CF (objc.c), audio, network/GameKit/StoreKit (stub returning "unavailable").
-- [ ] Write the classification as a table in `docs/imports.md` (symbol → shim file → status).
+### Para probar en consola (Vita 192.168.3.15, VitaShell FTP en 1337)
+1. Instalar `build/raymanfiesta.vpk`.
+2. `python3 -I tools/deploy_data.py` (sube `ux0_data/raymanfiesta/` → `ux0:data/raymanfiesta/`).
+3. Requisitos en la consola: `kubridge.skprx` en `ur0:tai/config.txt` y `libshacccg.suprx` (ShaRKBR33D).
+4. Abrir el juego; si se cierra o queda en negro: `python3 -I tools/deploy_data.py --logs` y leer `logs/raymanfiesta_NNN.log` (+ `.psp2dmp`).
+5. Rotación incorrecta: mantener SELECT+START 2 s (cicla y guarda `rotation.txt`).
+6. Botones: editar `ux0:data/raymanfiesta/controls.txt` por FTP (coordenadas de lo que se ve), sin recompilar.
 
-### Phase 3: Real engine analysis
-- [ ] Identify the engine by symbols (`grep -i` on `symbols.txt`: `cocos2d`, `Unity`, `SIO2`, `oolong`, `Box2D`, custom `CS_`/`GS_` prefixes), never assume "same engine as another port".
-- [ ] Map the lifecycle from section 1's candidates: app delegate class, GL view class (`EAGLView`/`ES1Renderer`), how the frame loop is driven (`NSTimer`, `CADisplayLink`, `performSelector:afterDelay:`, or a game thread).
-- [ ] Find where resources are opened (`fopen`, `NSBundle pathForResource:ofType:`, `UIImage imageNamed:`) -- these define what `BUNDLE_PATH` must serve.
-- [ ] Detect middleware (OpenAL, FMOD, libpng, zlib, Flurry/analytics) and decide stub vs. implementation. Analytics/ads/StoreKit = stub.
+### Riesgos conocidos
+- GLKView a 1136x640 (iPhone 5 @2x): si no rinde, `PORT_GLK_SCALE 1.69f` (960x540 nativo).
+- Bloques/GCD/ARC implementados por primera vez (sin prueba previa en ningún port).
+- Assets: 1,1 GB.
 
-### Phase 4: Loader and ObjC bootstrap (GATE: log reaches the app delegate)
-- [ ] `macho_load()` maps `__TEXT`/`__DATA` at `0x98000000`, applies `rebase.bin`, binds `__nl_symbol_ptr`/`__la_symbol_ptr`.
-- [ ] Every import in `imports.txt` resolves to a shim or `ml_unimpl_entry`; `[UNIMPL]` lines in the log are the to-do list.
-- [ ] `macho_run_inits()` runs `__mod_init_func` (C++ static constructors) without crashing.
-- [ ] ObjC: register the game's classes from `__objc_classlist`, implement `alloc/init/retain/release/autorelease`, `NSString`, `NSArray`, `NSDictionary`, `NSUserDefaults` (backed by `saves/`), `NSBundle mainBundle resourcePath`.
-- [ ] Call the delegate's `applicationDidFinishLaunching:` (or `application:didFinishLaunchingWithOptions:`) via `call_guest`. Log `[BOOT] delegate ok`.
+### Revisión independiente del runtime (misma sesión, antes de la consola)
+Un revisor aparte leyó asm.S/objc.c/macho.c. Se corrigió:
+- **Crítico:** las cadenas ObjC (selectores, nombres de clase, UTF-16) viven en `__TEXT` y se leían antes de `macho_finalize()` (el bloque RX todavía estaba vacío). Ahora `foundation_fix_cfstrings` + `objc_init_image` corren después; las escrituras en `__TEXT` van por `macho_write_word` (kubridge).
+- Pool de autorelease por hilo (TLS); antes era uno solo compartido → use-after-free con hilos/GCD.
+- Caché de métodos sin carrera (cls=0 → imp/sel → cls, con barreras y re-chequeo).
+- `-dealloc` no puede correr dos veces (rc centinela durante el dealloc).
+- `methodForSelector:` devuelve un thunk con `ml_align_call` para IMPs nativas; `objc_ivar_set` libera el valor anterior.
+- Pendiente (latente, sin uso en estos binarios): `+initialize`/`+load` no se envían; `nil_imp` en llamadas `_stret` deja el struct sin tocar.
+- Verificado correcto por el revisor: balance de pila/registros de todos los trampolines, `ml_dispatch_imp` (Thumb incluido), `objc_msgSendSuper2`, setjmp, cadena de metaclases, mapeo y thunks de macho.c, firmas nativas con CGRect/NSRange/double.
 
-### Phase 5: Graphics (GATE: first frame on screen)
-- [ ] vitaGL init (`vglInitExtended`) at 960x544, SoftFP build; `EAGLContext`/`CAEAGLLayer`/`renderbufferStorage:fromDrawable:` shims backed by the virtual FBO (`source/gles.c`).
-- [ ] Orientation: rotate/scale the virtual FBO for portrait games (320x480 / 640x960 / 768x1024) to 960x544 with correct aspect.
-- [ ] `presentRenderbuffer:` → `vglSwapBuffers`; drive the game's draw selector from the main loop at its native rate.
-- [ ] Textures: CgBI PNG via `source/cgbi.c` (`tools/cgbi_check.py` to verify), PVRTC via vitaGL; `GL_FIXED` vertex arrays converted.
-- [ ] GLES2 games: GLSL shaders → `psvita-toolkit shader-transpile` / `shader-live-reload`.
+## 2026-11-11 — Corrida 012: crash en el mapa del mundo (TeensyUnlockManager)
+- Dump: `Undefined instruction` en PC 0x983b6b6a → Mach-O 0x3b6b6a = `trap` de chequeo de rango en el draw
+  (0x3b67d0) de `Ray_RFR_TeensyUnlockManagerComponent` (RTTI de la vtable 0x56c7b8). Tabla de UVs vacía
+  (+0x190/+0x194 = 0, +0x18c basura): el init (0x3b65ac) la llena solo si `texture(+0xb4)->uvAtlas(+0x84)`
+  ya existe, y la textura (`teensy_icone.png`, atlas presente en el IPA) aún no pasó por postCreate. Mismo caso que ScoreLum.
+- Parche (`source/patch.c`): la entrada del draw en la vtable (0x56c7e8) pasa por `teensy_draw`, que llena
+  la tabla tarde (0x21f3d4 clear, 0x336508 resize, 0xb1274 por frame) o no dibuja si sigue sin atlas.
+  Log de control: `patch: teensy UVs tarde: tex=… atlas=… n=…` (una vez).
 
-### Phase 6: Touch
-- [ ] Front touch → `UITouch` objects with `locationInView:` in the game's logical coordinates (undo the FBO rotation/scale).
-- [ ] Deliver `touchesBegan/Moved/Ended:withEvent:` to the view that the game registered; multitouch if `multipleTouchEnabled`.
-- [ ] Rear panel disabled or mapped (see Phase 7).
+## 2026-11-11 — Corrida 013: jugable; fluidez ~10 FPS reales con contador a 30/60
+- Parche del teensy OK (sin crash): `tex=0x87fc9aa8 atlas=0x0 n=0` → esa textura sigue sin atlas al dibujar,
+  el contador de teensies no se dibuja (pendiente, menor).
+- Nivel: 600 presents / 10 s pero ~20 draw calls por present → la mayoría de los swaps repiten el cuadro.
+  El juego dibuja y presenta solo desde `drawFrame` (CADisplayLink, 60 Hz → `presentRenderbuffer:`) y su
+  `glkView:drawInRect:` está vacío (`bx lr` en 0xbbd0), pero nuestro GLKViewController (timer 30 Hz) hacía
+  otro `gles_present` con vsync en cada tick: vblanks perdidos y cuadros repetidos.
+- Cambio (`source/uikit.c`, pendiente llevar a la copia maestra): `gv_display` omite el swap si el
+  drawInRect no dibujó nada y el juego ya presentó por su cuenta. La línea `vivo:` ahora cuenta presents
+  del juego y swaps de GLKView omitidos.
 
-### Phase 7: Physical controls
-- [ ] Default mapping: D-pad/stick/✕○□△/L/R/START/SELECT → synthesized touches on the on-screen buttons (`source/input.c` touch layer) or direct calls into the game's input functions when found in `symbols.txt`.
-- [ ] Analog deadzone (~8-12) and sensitivity with sane defaults.
-- [ ] Remappable `controls.txt` in `ux0:data/raymanfiesta/` (`VITA_BUTTON = GAME_ACTION`); missing file = defaults.
-
-### Phase 8: Audio
-- [ ] AudioUnit RemoteIO / AudioQueue / OpenAL / `AVAudioPlayer` (whichever `frameworks.txt` shows) → `sceAudioOut` thread (`source/coreaudio.c`).
-- [ ] Music (often `.caf`/`.m4a`/`.mp3`) decodes; convert offline with a script if no decoder fits.
-- [ ] No crackle/drift; pause on suspend; volume settings respected.
-
-### Phase 9: Videos / FMV
-- [ ] Inventory `.m4v`/`.mp4` in the bundle; `MPMoviePlayerController` shim → `sceAvPlayer`.
-- [ ] Button skip and graceful skip when the video is missing (never hang on black screen).
-
-### Phase 10: Assets, data, language and saves
-- [ ] `NSHomeDirectory()`/`Documents`/`Library/Caches` → `ux0:data/raymanfiesta/saves/`; bundle reads → `game_app/`.
-- [ ] Boot checker: if `game_app/rfr_dev` or `rebase.bin` is missing, show a dialog with the exact path.
-- [ ] `NSLocale preferredLanguages` / `AppleLanguages` → Vita system language (`sceAppUtilSystemParamGetById`), English fallback.
-- [ ] Saves survive restart and suspend.
-
-### Phase 11: Performance
-- [ ] 444/222/222/166 clocks at boot (already in `main.c`); optional PSVshell note in README.
-- [ ] Stable frame time (`psvita-toolkit perf-telemetry`), memory under control (`psvita-toolkit mem-profile`), long session without leaks.
-
-### Phase 12: Configurator and options
-- [ ] Persistent settings in `saves/` (deadzones, sensitivity, FPS lock, filter, touch overlay).
-
-### Phase 13: Trophies
-- [ ] Map GameKit achievements (if `GameKit` is linked, grep `reportAchievement`/`GKAchievement`) to `sceNpTrophy` unlocks; otherwise a short achievable list.
-
-### Phase 14: LiveArea and VPK
-- [ ] `icon0.png` 128x128, `bg.png` 840x500, `startup.png` 280x158 (8-bit indexed) -- `psvita-toolkit livearea --validate`.
-- [ ] `param.sfo` with Title ID `PSVRFR001`; VPK installs without warnings.
-
-### Phase 15: Real-hardware testing and release
-- [ ] Full playthrough without crashes; suspend/resume OK; Vita 1000/2000/PSTV status stated.
-- [ ] Production build: `PORT_TRACE=OFF` or `psvita-toolkit log-trace --remove`.
-- [ ] README states the exact IPA version tested and that the user must supply a **decrypted** IPA.
+## 2026-11-11 — Corrida 014: velocidad OK; la partida guardada no carga
+- En la Vita `Documents/` tiene `slot0.dat` (2393 B), `Activities`, `Achievements`: el juego escribe.
+- El slot del juego es un `ByteArrayDocument : UIDocument` (`initWithFileName:url:`, `saveToURL:…`,
+  `openWithCompletionHandler:`, `loadFromContents:ofType:error:`). `UIDocument` era una clase vacía →
+  `-[UIDocument initWithFileURL:] sin implementar` → nil → open/save del documento no hacían nada.
+  `Activities` se lee con `NSFileHandle`, que también faltaba ("No data in file Activities").
+- Cambios (runtime, pendiente llevar a la copia maestra): `UIDocument` local en `uikit.c` (open/revert →
+  `loadFromContents:`, save → `contentsForType:` + `writeToFile:`, completions ^(BOOL) en la cola
+  principal vía `gcd_main_block` de `ios5.c`); `NSFileHandle` sobre `FILE*` en `foundation.c`.
+  Log de control: `UIDocument open/save <ruta> -> 0/1`.
