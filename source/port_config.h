@@ -13,8 +13,7 @@
 #define GLES_POOL_MB 32
 #define PORT_ACCEL_FROM_STICK 0
 // iPhone 5: 320x568 puntos @2x. La GLKView dibuja a 1136x640 y gles_present lo baja a 960x544.
-// ponytail: si el rendimiento no alcanza, PORT_GLK_SCALE 1.69f da 960x540 nativo (probar en consola).
 #define PORT_SCREEN_W 320
 #define PORT_SCREEN_H 568
 #define PORT_SCREEN_SCALE 2.0f
-#define PORT_GLK_SCALE 2.0f
+#define PORT_GLK_SCALE 2.0f // 960x541 desfasa el touch del motor (convierte puntos con la escala 2.0) y no ganaba FPS: CPU-bound

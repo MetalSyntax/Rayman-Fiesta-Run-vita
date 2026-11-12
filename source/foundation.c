@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <math.h>
 #include <psp2/apputil.h>
+#include <psp2/io/fcntl.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/system_param.h>
@@ -1177,18 +1178,23 @@ static id data_new(objc_class *cls, const void *b, int n, int copy) {
     }
     return d;
 }
+extern uint64_t ml_io_us;
 static id data_from_file(objc_class *cls, const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    extern void ml_stack_probe(const char *tag);
+    ml_stack_probe(path);
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
+    if (fd < 0) {
         l_error("NSData contentsOfFile:%s -> nil", path);
         return NULL;
     }
-    fseek(f, 0, SEEK_END);
-    long n = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    int n = sceIoLseek32(fd, 0, SCE_SEEK_END);
+    sceIoLseek32(fd, 0, SCE_SEEK_SET);
     ns_data *d = data_new(cls, NULL, n, 1);
-    fread(d->bytes, 1, n, f);
-    fclose(f);
+    int got = sceIoRead(fd, d->bytes, n); // de una vez: fread de newlib iba de a 1 KB
+    sceIoClose(fd);
+    d->len = got > 0 ? got : 0;
+    ml_io_us += sceKernelGetProcessTimeWide() - t0;
     return d;
 }
 static id dt_data(objc_class *cls, SEL _c) { return AR(data_new(cls, NULL, 0, 1)); }
@@ -1234,6 +1240,8 @@ static void dt_dealloc(ns_data *self, SEL _c) {
 static int dt_length(ns_data *self, SEL _c) { return self->len; }
 static void *dt_bytes(ns_data *self, SEL _c) { return self->bytes; }
 static void dt_getBytes(ns_data *self, SEL _c, void *out, int n) { memcpy(out, self->bytes, n < self->len ? n : self->len); }
+// -getBytes: copia todo (Rayman Fiesta Run lee Documents/Activities así; sin esto parseaba basura).
+static void dt_getAllBytes(ns_data *self, SEL _c, void *out) { memcpy(out, self->bytes, self->len); }
 static int dt_writeToFile(ns_data *self, SEL _c, id path, int atomic) {
     FILE *f = fopen(ns_cstr(path), "wb");
     if (!f)
@@ -1278,7 +1286,7 @@ static const nmethod nsdata_c[] = {
 static const nmethod nsdata_i[] = {
     NM("initWithContentsOfFile:", dt_initWithContentsOfFile), NM("initWithBytes:length:", dt_initWithBytes),
     NM("initWithLength:", dt_initWithLength), NM("initWithCapacity:", dt_initWithLength), NM("dealloc", dt_dealloc),
-    NM("length", dt_length), NM("bytes", dt_bytes), NM("mutableBytes", dt_bytes), NM("getBytes:length:", dt_getBytes),
+    NM("length", dt_length), NM("bytes", dt_bytes), NM("mutableBytes", dt_bytes), NM("getBytes:length:", dt_getBytes), NM("getBytes:", dt_getAllBytes),
     NM("writeToFile:atomically:", dt_writeToFile), NM("appendBytes:length:", dt_appendBytes),
     NM("appendData:", dt_appendData), NM("setLength:", dt_setLength), NM("increaseLengthBy:", dt_increaseLength),
     NM("copy", dt_copy), {0}};
@@ -1551,7 +1559,10 @@ static id b_pathForResource(id self, SEL _c, id name, id type, id dir) {
     struct stat st;
     // El bundle no cambia: se recuerdan los fallos (el DLC sondea pkg_childN_01.zip.OK cientos de
     // veces al arrancar y cada fallo son 3 stat sobre exFAT: ~23 s de pantalla negra).
-    static uint32_t miss[256];
+    static struct {
+        uint32_t h;
+        id path; // NULL = no existe
+    } cache[512];
     uint32_t h = 2166136261u;
     for (const char *s3[] = {n, t, d}, **q = s3; q < s3 + 3; q++)
         for (const char *c = *q;; c++) {
@@ -1560,8 +1571,10 @@ static id b_pathForResource(id self, SEL _c, id name, id type, id dir) {
                 break;
         }
     h |= 1;
-    if (miss[h & 255] == h)
-        return NULL;
+    if (cache[h & 511].h == h)
+        return cache[h & 511].path;
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    id found = NULL;
     // 1) carpeta pedida 2) <idioma>.lproj 3) en.lproj
     const char *lp[] = {d, NULL, "en.lproj"};
     char lproj[32];
@@ -1571,17 +1584,18 @@ static id b_pathForResource(id self, SEL _c, id name, id type, id dir) {
         if (i && *d)
             break;
         snprintf(p, sizeof(p), BUNDLE_PATH "%s%s%s%s%s", lp[i], *lp[i] ? "/" : "", n, *t ? "." : "", t);
-        if (!stat(p, &st))
-            return ns_str(p);
-        if (!i) {
-            snprintf(p, sizeof(p), BUNDLE_PATH "%s%s%s", n, *t ? "." : "", t);
-            if (!stat(p, &st))
-                return ns_str(p);
+        if (!stat(p, &st) || (!i && (snprintf(p, sizeof(p), BUNDLE_PATH "%s%s%s", n, *t ? "." : "", t), !stat(p, &st)))) {
+            found = ns_str(p);
+            break;
         }
     }
-    l_error("NSBundle pathForResource:%s ofType:%s inDirectory:%s -> nil", n, t, d);
-    miss[h & 255] = h;
-    return NULL;
+    ml_io_us += sceKernelGetProcessTimeWide() - t0;
+    if (!found)
+        l_error("NSBundle pathForResource:%s ofType:%s inDirectory:%s -> nil", n, t, d);
+    objc_release(cache[h & 511].path);
+    cache[h & 511].h = h;
+    cache[h & 511].path = objc_retain(found); // el juego puede liberar el suyo
+    return found;
 }
 static id b_pathForResource2(id self, SEL _c, id name, id type) { return b_pathForResource(self, _c, name, type, NULL); }
 static id b_bundleIdentifier(id self, SEL _c) {
@@ -2225,7 +2239,7 @@ static id url_path(id self, SEL _c) {
 static const nmethod nsurl_c[] = {
     NM("URLWithString:", url_with), NM("fileURLWithPath:", url_with), NM("fileURLWithPath:isDirectory:", url_with), {0}};
 static const nmethod nsurl_i[] = {
-    NM("initWithString:", s_initWithString), NM("path", url_path), NM("absoluteString", s_self_copy),
+    NM("initWithString:", s_initWithString), NM("initFileURLWithPath:", s_initWithString), NM("path", url_path), NM("absoluteString", s_self_copy),
     NM("isFileURL", o_yes), {0}};
 // NSURLConnection: sin red -> nil. NSXMLParser: parse = NO. NSError: dominio/código genéricos.
 static const nmethod nsurlconn_c[] = {

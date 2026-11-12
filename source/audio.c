@@ -130,7 +130,12 @@ static int af_OpenURL(id url, int perms, uint32_t hint, audio_file **out) {
     char p[512];
     const char *path = try_ext(in, ".ogg", p, sizeof(p));
     audio_file *a = calloc(1, sizeof(*a));
-    if (path && !ov_fopen(path, &a->vf)) {
+    FILE *of = path ? fopen(path, "rb") : NULL;
+    if (of)
+        setvbuf(of, NULL, _IOFBF, 64 * 1024); // la música se lee mientras el juego carga: menos sceIoRead
+    if (of && ov_open(of, &a->vf, NULL, 0)) // ov_open se adueña del FILE solo si tiene éxito
+        fclose(of), of = NULL;
+    if (of) {
         vorbis_info *vi = ov_info(&a->vf, -1);
         a->kind = 1;
         a->channels = vi->channels;

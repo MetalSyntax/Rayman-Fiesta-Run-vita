@@ -762,7 +762,7 @@ static void cg_RotateCTM(cg_ctx *c, float r) {
     c->ctm.a = m.a * k + m.c * s, c->ctm.b = m.b * k + m.d * s;
     c->ctm.c = m.c * k - m.a * s, c->ctm.d = m.d * k - m.b * s;
 }
-static void put_px(cg_ctx *c, uint8_t *d, const uint8_t *s, int premul_src) {
+static inline __attribute__((always_inline)) void put_px(cg_ctx *c, uint8_t *d, const uint8_t *s, int premul_src) {
     uint8_t r = s[0], g = s[1], b = s[2], a = s[3];
     int alpha_mode = c->info & 0x1F; // 1 premulLast 2 premulFirst 3 last 4 first 5 noneSkipLast 6 noneSkipFirst
     int want_premul = alpha_mode == 1 || alpha_mode == 2;
@@ -799,18 +799,21 @@ static void cg_DrawImage(cg_ctx *c, CGRect r, cg_image *img) {
     if (det == 0)
         return;
     int bpp = c->gray ? 1 : 4;
+    // (u, v) es afín en (col, fila): inversa del CTM y del rect calculadas una vez; en el bucle solo sumas
+    // (antes 4 divisiones por píxel: ~1 s por textura de 1024² en la carga).
+    float iw = 1.0f / (det * r.s.w), ih = 1.0f / (det * r.s.h);
+    float du = m.d * iw, dv = -m.b * ih; // por columna
     for (int row = 0; row < c->h; row++) {
-        float dy = c->h - 1 - row + 0.5f;
+        float dy = c->h - 1 - row + 0.5f, dx = 0.5f;
+        float u = (m.d * (dx - m.tx) - m.c * (dy - m.ty)) * iw - r.o.x / r.s.w;
+        float v = (-m.b * (dx - m.tx) + m.a * (dy - m.ty)) * ih - r.o.y / r.s.h;
         uint8_t *dst = c->data + row * c->bpr;
-        for (int col = 0; col < c->w; col++) {
-            float dx = col + 0.5f;
-            // inversa del CTM
-            float ux = (m.d * (dx - m.tx) - m.c * (dy - m.ty)) / det;
-            float uy = (-m.b * (dx - m.tx) + m.a * (dy - m.ty)) / det;
-            float u = (ux - r.o.x) / r.s.w, v = (uy - r.o.y) / r.s.h;
+        for (int col = 0; col < c->w; col++, u += du, v += dv) {
             if (u < 0 || u >= 1 || v < 0 || v >= 1)
                 continue;
             int ix = (int)(u * img->w), iy = (int)((1 - v) * img->h);
+            if (ix >= img->w)
+                ix = img->w - 1;
             if (iy >= img->h)
                 iy = img->h - 1;
             put_px(c, dst + col * bpp, img->rgba + (iy * img->w + ix) * 4, img->premul);
@@ -1205,7 +1208,8 @@ static int gv_drawableWidth(id self, SEL _c) { return glk_w(self); }
 static int gv_drawableHeight(id self, SEL _c) { return glk_h(self); }
 static void gv_setFmt(id self, SEL _c, int v) {}
 static int gv_fmt(id self, SEL _c) { return 0; }
-static void gv_setScale(id self, SEL _c, float s) { GX(self)->scale = s; }
+// Tope PORT_GLK_SCALE: Rayman pide 2.0 (1136x640) y en la Vita conviene dibujar a resolución nativa.
+static void gv_setScale(id self, SEL _c, float s) { GX(self)->scale = s > PORT_GLK_SCALE ? PORT_GLK_SCALE : s; }
 static float gv_scale(id self, SEL _c) { return GX(self)->scale; }
 static void gv_bindDrawable(id self, SEL _c) {
     int w = glk_w(self), h = glk_h(self);
@@ -1365,11 +1369,19 @@ typedef struct {
     int interval, paused;
     double ts;
 } display_link;
+static uint64_t dl_us; // tiempo dentro del callback del CADisplayLink (frame del juego)
 static void dl_fire(display_link *self, SEL _c, id timer) {
     if (self->paused)
         return;
-    self->ts = sceKernelGetProcessTimeWide() / 1e6;
+    extern volatile uint64_t ml_frame_start;
+    extern SceUID ml_main_thid;
+    uint64_t t0 = sceKernelGetProcessTimeWide();
+    self->ts = t0 / 1e6;
+    ml_main_thid = sceKernelGetThreadId();
+    ml_frame_start = t0;
     objc_msg(self->target, self->sel, (uint32_t)self, 0, 0, 0);
+    ml_frame_start = 0;
+    dl_us += sceKernelGetProcessTimeWide() - t0;
 }
 static id dl_make(id cls, SEL _c, id target, SEL sel) {
     display_link *d = objc_alloc(c_CADisplayLink);
@@ -1520,6 +1532,7 @@ void ui_runloop_tick(double max_wait) {
     tick_depth--;
 }
 
+extern uint64_t ml_io_us;
 void ui_runloop_forever(void) {
     static uint64_t last_log;
     l_info("run loop principal");
@@ -1529,8 +1542,16 @@ void ui_runloop_forever(void) {
         objc_pool_pop();
         uint64_t now = sceKernelGetProcessTimeWide();
         if (now - last_log > 10 * 1000000ULL) {
-            l_info("vivo: %u frames presentados (%u del juego, %u GLKView omitidos), %u draw calls", (unsigned)frames,
-                   (unsigned)game_presents, (unsigned)glk_skipped, (unsigned)gles_get_draw_calls());
+            static uint32_t last_frames;
+            uint32_t prof[3];
+            gles_take_prof(prof);
+            l_info("vivo: %u frames presentados (%u del juego, %u GLKView omitidos), %u draw calls; %u ms en swap "
+                   "(%u frames en 10 s), %u ms en drawFrame, %u ms en E/S; GL: %u ms draws, %u ms buffers, %u ms texturas",
+                   (unsigned)frames, (unsigned)game_presents, (unsigned)glk_skipped, (unsigned)gles_get_draw_calls(),
+                   (unsigned)(gles_take_swap_us() / 1000), (unsigned)(frames - last_frames), (unsigned)(dl_us / 1000),
+                   (unsigned)(ml_io_us / 1000), (unsigned)prof[0], (unsigned)prof[1], (unsigned)prof[2]);
+            dl_us = ml_io_us = 0;
+            last_frames = frames;
             last_log = now;
         }
     }

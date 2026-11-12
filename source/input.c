@@ -23,8 +23,10 @@
 extern int port_rotation;
 
 static struct {
-    int id, down;
+    int id, down, moving;
+    float x0, y0; // donde apoyó (puntos)
 } fingers[2];
+#define TOUCH_SLOP 4.0f // pt: el panel tiembla; iOS no manda touchesMoved sin movimiento y el mapa lo toma como arrastre
 static uint32_t prev_buttons;
 static float stick_x, stick_y;
 static uint64_t combo_since;
@@ -141,9 +143,15 @@ void input_poll(void) {
                 continue;
             fingers[k].down = 1;
             fingers[k].id = t.report[i].id;
+            fingers[k].moving = 0;
+            fingers[k].x0 = vx, fingers[k].y0 = vy;
             ui_touch_event(k, 0, vx, vy);
         } else {
-            ui_touch_event(k, 1, vx, vy);
+            float dx = vx - fingers[k].x0, dy = vy - fingers[k].y0;
+            if (!fingers[k].moving && dx * dx + dy * dy > TOUCH_SLOP * TOUCH_SLOP)
+                fingers[k].moving = 1;
+            if (fingers[k].moving)
+                ui_touch_event(k, 1, vx, vy);
         }
     }
 

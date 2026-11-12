@@ -11,4 +11,6 @@ void gles_bind_screen(void);                // GLKView bindDrawable             
 int gles_rotation(void);                   // 0 sin girar, 1 landscape-right, 2 landscape-left
 void gles_dest_rect(int *x, int *y, int *w, int *h);
 uint32_t gles_get_draw_calls(void);
+void gles_take_prof(uint32_t ms[3]); // ms en draws, buffers, texturas desde la última llamada
+uint64_t gles_take_swap_us(void); // tiempo en vglSwapBuffers desde la última llamada
 int ime_active(void);

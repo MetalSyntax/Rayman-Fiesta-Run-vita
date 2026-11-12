@@ -72,3 +72,70 @@ Un revisor aparte leyó asm.S/objc.c/macho.c. Se corrigió:
   `loadFromContents:`, save → `contentsForType:` + `writeToFile:`, completions ^(BOOL) en la cola
   principal vía `gcd_main_block` de `ios5.c`); `NSFileHandle` sobre `FILE*` en `foundation.c`.
   Log de control: `UIDocument open/save <ruta> -> 0/1`.
+
+## 2026-11-11 — Corrida 015: crash al cargar `Documents/Activities`
+- Dump: Data abort en PC 0x9837e0c8 → Mach-O 0x37e0c8, `str r11,[tabla+id*36+8]` con la tabla estática en
+  0x599ab0 (`__data`) e id=12817 (`objectIdentifier`). El parser de Activities leía basura (`nbActivities = 5012`
+  con el archivo real en ceros): el lector del juego (0x1f448) hace `readDataToEndOfFile` → `getBytes:` y
+  `-[NSData getBytes:]` no existía (`sin implementar` en el log) → buffer sin inicializar.
+- Cambio (`source/foundation.c`, pendiente llevar a la copia maestra): `-[NSData getBytes:]` copia todo el contenido.
+
+## 2026-11-11 — Corrida 018: guardado OK; mapa a ~19 FPS
+- `-[NSData getBytes:]` confirmado: el guardado carga. Logs bajados con `deploy_data.py --logs`.
+- El GLKView dibujaba a 1136x640 (el juego hace `setContentScaleFactor:2.0` en 0x2e4d0) y `gles_present` lo
+  escalaba a 960x544: ~39% más píxeles que la pantalla, en un juego 2D con mucho alpha (fillrate).
+- Cambio: `PORT_GLK_SCALE 1.6901408f` (568x320 pt → 960x541) y `gv_setScale` topa la escala pedida en
+  `PORT_GLK_SCALE` (`uikit.c`; en los otros ports el tope es la escala de pantalla, sin cambio).
+  La línea `vivo:` ahora suma `ms en swap` (tiempo en `vglSwapBuffers` = espera de GPU/vsync) y frames por 10 s:
+  swap alto → GPU; swap bajo con pocos FPS → CPU del juego/runtime.
+- A verificar en consola: imagen completa (no recortada a la esquina). Si sale recortada, el motor fija su
+  viewport con una resolución propia (1136x640) y hay que volver a 2.0f o remapear viewport/scissor.
+
+## 2026-11-12 — Corrida 019: CPU-bound; touch desfasado; carga negra; sin música
+- `vivo:` en el mapa: ~18 FPS con solo ~27 ms/10 s en `vglSwapBuffers` → la GPU está ociosa, el límite es CPU.
+  Bajar a 960x541 no ganó FPS y desfasó el touch (el motor pasa puntos a píxeles con la escala 2.0) →
+  `PORT_GLK_SCALE` vuelve a 2.0f (el tope en `gv_setScale` queda, es inocuo).
+- Arranque: 10 s → 42 s hasta el menú con ~1–4 presents/s de 1 draw call: la carga es síncrona en el hilo
+  principal; `loading.png` (1024², igual que `ThreeLogos.png`) se carga sin error pero no se ve.
+  Diagnóstico temporal en `gles.c` (`diag N ...`, primeras 150 draw calls: textura, blend, color, fb, viewport).
+- E/S: `NSData dataWithContentsOfFile:` lee con un solo `sceIoRead` (antes fread de newlib); `fopen` de lectura
+  con buffer de 64 KB; `pathForResource:` cachea aciertos y fallos (512 entradas). La línea `vivo:` suma
+  `ms en drawFrame` y `ms en E/S`.
+- Música: `AVAudioPlayer` traído de Zenonia5 (`ios5.c`, hilo + puerto VOICE sobre los .ogg de stage_data.sh)
+  y `-[NSURL initFileURLWithPath:]`. Pendiente llevar todo a la copia maestra.
+
+## 2026-11-12 — Corrida 020: música OK; doble toque en el mapa; mapa ~18 FPS
+- Mapa: 181 frames/10 s, `drawFrame` 7,7 s/10 s (~42 ms CPU por frame), swap 28 ms, E/S 0, ~124 draws/frame.
+  Nivel: ~45 FPS con ~50 draws/frame y ~14 ms/frame → el costo crece con las draw calls (~0,4 ms c/u en el mapa).
+  Se agregó perfil por categoría a `vivo:` (`GL: X ms draws, Y ms buffers, Z ms texturas`) para la próxima corrida.
+- Doble toque: `input_poll` mandaba `touchesMoved:` en cada sondeo con el dedo quieto (iOS no lo hace); el temblor
+  del panel se veía como arrastre del mapa y cancelaba la entrada al mundo. Ahora sin `touchesMoved` hasta
+  superar `TOUCH_SLOP` (4 pt) desde donde apoyó.
+- Arranque negro: las 61 draw calls hasta el menú usan todas la textura 2 (quad, blend on, color 1). Diagnóstico
+  extendido: `diag tex N <- WxH` (subidas) y `diag tex N borrada` durante las primeras 150 draws.
+- `AVAudioPlayer: sceAudioOutOpenPort = 0x80260005` una vez (puertos VOICE agotados: cada reproductor que suena
+  ocupa uno). Pendiente si se nota falta de algún tema.
+
+## 2026-11-12 — Corrida 021: touch OK; carga negra confirmada; buffers caros en el mapa
+- Touch con `TOUCH_SLOP`: el usuario confirma que entra a los mundos con un toque.
+- Arranque: a los 10,7 s el juego borra la textura del logo (tex 2), a los 12,5 s sube `loading.png` (1024², tex 2)
+  y **no hace ninguna draw call** hasta ~35 s: el hilo principal queda dentro de un solo `drawFrame` toda la carga.
+  En iOS se ve "Cargando.." (captura del usuario). Diagnóstico: `ml_stack_probe` (darwin.c) anota, si el frame lleva
+  > 1 s, las direcciones de retorno del juego en la pila del hilo principal en cada fopen/NSData/glTexImage2D
+  (`pila <archivo> (frame N ms): ...`, máx. 40). Se quitó el `diag` por draw call.
+- Mapa: GL 0,28 s draws + **2,2 s buffers** por cada 10 s. `vbo_copy` pasó de búsqueda lineal (4096, y
+  `BufferSubData` sin cortar) a hash con sondeo lineal y lápidas (probado en host).
+- Música entrecortada durante la carga: los .ogg se abren con `fopen` + `setvbuf` 64 KB + `ov_open`.
+
+## 2026-11-12 — Corrida 022: causa de la carga negra (reloj roto) y carga lenta (CGContextDrawImage)
+- Pantalla "Cargando..": el cargador llama (vtable 0x5548c4) a 0x1a1c0c, que redibuja y presenta
+  (0x2e720 empezar / 0x2e724 presentar) si pasaron ≥300 ms según el reloj global 0x5ca5a0 (vtable 0x547dd8,
+  +0x10 = 0x20975: `gettimeofday` → ms). `gettimeofday` estaba enlazado directo a newlib: `timeval` de 16 bytes
+  (`time_t` 64 bits) contra 8 en iOS armv7 → µs leídos de la parte alta de los segundos y el `r7` guardado del
+  juego pisado. Igual `time(&t)` (105 usos, escribía 8 bytes en 4), `difftime` y `localtime/gmtime(_r)` (leían
+  8 bytes de un `time_t` de 4). Todos envueltos con tipos de Darwin (`darwin.c`).
+- Carga: entre abrir cada PNG y su `glTexImage2D` pasaban 0,4–1,6 s; `glTexImage2D` en sí sumaba 187 ms.
+  `cg_DrawImage` hacía 4 divisiones float por píxel y `put_px` como llamada: ahora u/v incrementales y
+  `put_px` en línea (mismo resultado píxel a píxel en host: identidad, volteo y escala).
+- Mapa: buffers 2,2 s → 1,5 s por cada 10 s con el hash; sigue siendo lo más caro de GL (el resto es de vitaGL).
+- Se quitó el diagnóstico de texturas; queda `ml_stack_probe` (pila en frames > 1 s).

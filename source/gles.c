@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <psp2/kernel/processmgr.h>
 #include <vitaGL.h>
 
 #include "gles.h"
@@ -52,6 +53,17 @@ static GLint env_mode = GL_MODULATE;
 static GLfixed color[4] = {0x10000, 0x10000, 0x10000, 0x10000};
 static GLuint bound_array_buffer, bound_element_buffer;
 
+static uint32_t draw_calls;
+uint32_t gles_get_draw_calls(void) { return draw_calls; }
+// Perfil por categoría (us), para la línea "vivo:": draws, buffers, texturas.
+static uint64_t prof_us[3];
+#define PROF_T0 uint64_t prof_t0 = sceKernelGetProcessTimeWide()
+#define PROF_T1(k) (prof_us[k] += sceKernelGetProcessTimeWide() - prof_t0)
+void gles_take_prof(uint32_t ms[3]) {
+    for (int i = 0; i < 3; i++)
+        ms[i] = prof_us[i] / 1000, prof_us[i] = 0;
+}
+
 // Copias en CPU de los VBO (para convertir GL_FIXED y para índices en glDrawElements).
 #define MAX_VBO 4096
 static struct {
@@ -59,24 +71,29 @@ static struct {
     void *data;
     int size;
 } vbo_copy[MAX_VBO];
-static void *vbo_data(GLuint id) {
-    for (int i = 0; i < MAX_VBO; i++)
+// Tabla hash con sondeo lineal (antes búsqueda lineal de 4096 por llamada: ~2 s de cada 10 en el mapa).
+#define VBO_DEAD 0xFFFFFFFFu // lápida de un borrado
+static int vbo_slot(GLuint id, int create) {
+    int dead = -1;
+    for (uint32_t n = 0, i = (id * 2654435761u) >> 20; n < MAX_VBO; n++, i = (i + 1) & (MAX_VBO - 1)) {
         if (vbo_copy[i].id == id)
-            return vbo_copy[i].data;
-    return NULL;
+            return i;
+        if (vbo_copy[i].id == VBO_DEAD && dead < 0)
+            dead = i;
+        if (!vbo_copy[i].id)
+            return create ? (dead >= 0 ? dead : (int)i) : -1;
+    }
+    return create ? dead : -1;
+}
+static void *vbo_data(GLuint id) {
+    int i = id ? vbo_slot(id, 0) : -1;
+    return i < 0 ? NULL : vbo_copy[i].data;
 }
 static void g_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
+    PROF_T0;
     GLuint id = target == GL_ARRAY_BUFFER ? bound_array_buffer : bound_element_buffer;
-    int free_slot = -1;
-    for (int i = 0; i < MAX_VBO; i++) {
-        if (vbo_copy[i].id == id) {
-            free_slot = i;
-            break;
-        }
-        if (free_slot < 0 && !vbo_copy[i].id)
-            free_slot = i;
-    }
-    if (free_slot >= 0 && id) {
+    int free_slot = id ? vbo_slot(id, 1) : -1;
+    if (free_slot >= 0) {
         vbo_copy[free_slot].id = id;
         vbo_copy[free_slot].data = realloc(vbo_copy[free_slot].data, size);
         vbo_copy[free_slot].size = size;
@@ -84,13 +101,30 @@ static void g_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLe
             memcpy(vbo_copy[free_slot].data, data, size);
     }
     glBufferData(target, size, data, usage);
+    PROF_T1(1);
+}
+static void g_glTexImage2D(GLenum t, GLint lv, GLint ifmt, GLsizei w, GLsizei h, GLint b, GLenum fmt, GLenum ty,
+                           const void *px) {
+    extern void ml_stack_probe(const char *tag);
+    ml_stack_probe("glTexImage2D");
+    PROF_T0;
+    glTexImage2D(t, lv, ifmt, w, h, b, fmt, ty, px);
+    PROF_T1(2);
+}
+static void g_glTexSubImage2D(GLenum t, GLint lv, GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum ty,
+                              const void *px) {
+    PROF_T0;
+    glTexSubImage2D(t, lv, x, y, w, h, fmt, ty, px);
+    PROF_T1(2);
 }
 static void g_glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void *data) {
+    PROF_T0;
     GLuint id = target == GL_ARRAY_BUFFER ? bound_array_buffer : bound_element_buffer;
-    for (int i = 0; i < MAX_VBO; i++)
-        if (vbo_copy[i].id == id && off + size <= vbo_copy[i].size)
-            memcpy((uint8_t *)vbo_copy[i].data + off, data, size);
+    int i = id ? vbo_slot(id, 0) : -1;
+    if (i >= 0 && off + size <= vbo_copy[i].size)
+        memcpy((uint8_t *)vbo_copy[i].data + off, data, size);
     glBufferSubData(target, off, size, data);
+    PROF_T1(1);
 }
 static void g_glBindBuffer(GLenum target, GLuint id) {
     if (target == GL_ARRAY_BUFFER)
@@ -100,13 +134,15 @@ static void g_glBindBuffer(GLenum target, GLuint id) {
     glBindBuffer(target, id);
 }
 static void g_glDeleteBuffers(GLsizei n, const GLuint *ids) {
-    for (int k = 0; k < n; k++)
-        for (int i = 0; i < MAX_VBO; i++)
-            if (vbo_copy[i].id == ids[k]) {
-                free(vbo_copy[i].data);
-                vbo_copy[i].data = NULL;
-                vbo_copy[i].id = 0;
-            }
+    for (int k = 0; k < n; k++) {
+        int i = ids[k] ? vbo_slot(ids[k], 0) : -1;
+        if (i >= 0) {
+            free(vbo_copy[i].data);
+            vbo_copy[i].data = NULL;
+            vbo_copy[i].size = 0;
+            vbo_copy[i].id = VBO_DEAD;
+        }
+    }
     glDeleteBuffers(n, ids);
 }
 
@@ -200,21 +236,29 @@ static void convert_fixed(int n) {
             set_pointer(k, n);
 }
 
-static uint32_t draw_calls;
-uint32_t gles_get_draw_calls(void) { return draw_calls; }
+static uint64_t swap_us;
+uint64_t gles_take_swap_us(void) {
+    uint64_t v = swap_us;
+    swap_us = 0;
+    return v;
+}
 
 static int skin(int n);
 static void unskin(void);
+static GLuint cur_fb;
 static void g_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    PROF_T0;
     draw_calls++;
     convert_fixed(first + count);
     int skinned = skin(first + count);
     glDrawArrays(mode, first, count);
     if (skinned)
         unskin();
+    PROF_T1(0);
 }
 
 static void g_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *idx) {
+    PROF_T0;
     draw_calls++;
     extern int palette_active(void);
     int need_fixed = palette_active();
@@ -234,6 +278,7 @@ static void g_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void
     glDrawElements(mode, count, type, idx);
     if (skinned)
         unskin();
+    PROF_T1(0);
 }
 
 // ---------------------------------------------------------------- estado *x / variantes
@@ -578,7 +623,7 @@ static struct {
     GLuint vgl;  // FBO real de vitaGL (render-to-texture)
     GLuint color_tex;
 } fbs[MAX_NAMES];
-static GLuint next_rb = 1, next_fb = 1, cur_rb, cur_fb;
+static GLuint next_rb = 1, next_fb = 1, cur_rb;
 
 static void g_glGenRenderbuffersOES(GLsizei n, GLuint *ids) {
     for (int i = 0; i < n; i++) {
@@ -767,7 +812,9 @@ void gles_present(void) {
     glVertexPointer(2, GL_FLOAT, 0, xy);
     glTexCoordPointer(2, GL_FLOAT, 0, uv_rot[gles_rotation()]);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    uint64_t t0 = sceKernelGetProcessTimeWide();
     vglSwapBuffers(ime_active());
+    swap_us += sceKernelGetProcessTimeWide() - t0;
 
     glPopMatrix();
     glMatrixMode(GL_PROJECTION);
@@ -815,8 +862,8 @@ const import_entry gles_imports[] = {
     F(glLoadMatrixx, g_glLoadMatrixx), D(glMaterialf), D(glMaterialfv), D(glMaterialx), F(glMatrixMode, g_glMatrixMode), F(glMultMatrixf, g_glMultMatrixf),
     F(glMultMatrixx, g_glMultMatrixx), D(glNormal3f), D(glOrthof), D(glOrthox), D(glPixelStorei), D(glPointSize), D(glPolygonOffset),
     F(glPopMatrix, g_glPopMatrix), F(glPushMatrix, g_glPushMatrix), D(glReadPixels), F(glRotatef, g_glRotatef), F(glRotatex, g_glRotatex), F(glScalef, g_glScalef),
-    F(glScalex, g_glScalex), D(glScissor), D(glShadeModel), D(glStencilFunc), D(glStencilMask), D(glStencilOp), D(glTexImage2D),
-    D(glTexParameteri), D(glTexParameteriv), D(glTexSubImage2D), F(glTranslatef, g_glTranslatef),
+    F(glScalex, g_glScalex), D(glScissor), D(glShadeModel), D(glStencilFunc), D(glStencilMask), D(glStencilOp), F(glTexImage2D, g_glTexImage2D),
+    D(glTexParameteri), D(glTexParameteriv), F(glTexSubImage2D, g_glTexSubImage2D), F(glTranslatef, g_glTranslatef),
     F(glTranslatex, g_glTranslatex), D(glViewport), D(glBlendEquation), D(glTexEnvfv), 
     D(glDeleteRenderbuffers), 
     F(glColor4x, g_glColor4x), F(glColor4f, g_glColor4f), F(glColor4ub, g_glColor4ub), F(glTexEnvi, g_glTexEnvi),

@@ -69,9 +69,48 @@ const char *darwin_path(const char *in, char *out, size_t outlen) {
 }
 #define PATH(p) char path_buf[512]; const char *P = darwin_path(p, path_buf, sizeof(path_buf))
 
+uint64_t ml_io_us; // tiempo en E/S de archivos (todos los hilos), para la línea "vivo:"
+// Diagnóstico temporal (carga negra antes del menú): si el hilo principal lleva > 1 s dentro de un
+// drawFrame (uikit.c pone ml_frame_start), anota las direcciones de retorno del juego que hay en su pila.
+volatile uint64_t ml_frame_start;
+SceUID ml_main_thid;
+void ml_stack_probe(const char *tag) {
+    static int lines;
+    static uint32_t seen[64];
+    uint64_t fs = ml_frame_start;
+    if (lines >= 40 || !fs || sceKernelGetThreadId() != ml_main_thid || sceKernelGetProcessTimeWide() - fs < 1000000)
+        return;
+    uint32_t *sp = __builtin_frame_address(0), ra[12];
+    int n = 0;
+    for (int i = 0; i < 2048 && n < 12; i++) {
+        uint32_t v = sp[i];
+        if ((v & 1) && is_guest_addr(v) && v - MACHO_SLIDE < 0x4c3358) // Thumb, dentro de __text
+            ra[n++] = v - MACHO_SLIDE - 1;
+    }
+    uint32_t h = n;
+    for (int i = 0; i < n; i++)
+        h = h * 31 + ra[i];
+    for (int i = 0; i < 64; i++)
+        if (seen[i] == h)
+            return;
+    seen[lines] = h;
+    lines++;
+    char buf[160];
+    int o = 0;
+    for (int i = 0; i < n && o < (int)sizeof(buf) - 10; i++)
+        o += snprintf(buf + o, sizeof(buf) - o, " %x", (unsigned)ra[i]);
+    l_info("pila %s (frame %u ms):%s", tag, (unsigned)((sceKernelGetProcessTimeWide() - fs) / 1000), buf);
+}
+#define IO_T0 uint64_t io_t0 = sceKernelGetProcessTimeWide()
+#define IO_T1 (ml_io_us += sceKernelGetProcessTimeWide() - io_t0)
 static FILE *d_fopen(const char *path, const char *mode) {
     PATH(path);
+    ml_stack_probe(path);
+    IO_T0;
     FILE *f = fopen(P, mode);
+    if (f && mode[0] == 'r' && !strchr(mode, '+'))
+        setvbuf(f, NULL, _IOFBF, 64 * 1024); // newlib lee de a 1 KB: cada sceIoRead en ux0 es caro
+    IO_T1;
     if (!f) // fallas siempre: un asset que no abre suele terminar en un puntero nulo lejos de acá
         l_error("fopen(%s, %s) -> NULL (pedido: %s)", P, mode, path);
     return f;
@@ -109,7 +148,16 @@ static int d_chdir(const char *path) {
 static int d_access(const char *path, int mode) {
     PATH(path);
     struct stat st;
-    return stat(P, &st);
+    IO_T0;
+    int r = stat(P, &st);
+    IO_T1;
+    return r;
+}
+static size_t d_fread(void *p, size_t sz, size_t n, FILE *f) {
+    IO_T0;
+    size_t r = fread(p, sz, n, f);
+    IO_T1;
+    return r;
 }
 static char *d_realpath(const char *path, char *out) {
     PATH(path);
@@ -163,7 +211,9 @@ static void to_darwin_stat(const struct stat *s, darwin_stat *d) {
 static int d_stat(const char *path, darwin_stat *out) {
     PATH(path);
     struct stat st;
+    IO_T0;
     int r = stat(P, &st);
+    IO_T1;
     if (!r && out)
         to_darwin_stat(&st, out);
     return r;
@@ -460,12 +510,36 @@ static darwin_tm *conv_tm(struct tm *t, darwin_tm *out) {
     out->zone = "UTC";
     return out;
 }
-static darwin_tm *d_localtime(const time_t *t) { return conv_tm(localtime(t), &tm_static); }
-static darwin_tm *d_gmtime(const time_t *t) { return conv_tm(gmtime(t), &tm_static); }
-static darwin_tm *d_localtime_r(const time_t *t, darwin_tm *out) {
-    struct tm tmp;
-    return conv_tm(localtime_r(t, &tmp), out);
+// iOS armv7: time_t y tv_sec son de 32 bits (timeval = 8 bytes); en newlib de la Vita son de 64
+// (timeval = 16): pasarlos directo leía basura y escribía 4-8 bytes de más en la pila del juego.
+typedef int32_t darwin_time_t;
+static darwin_tm *d_localtime(const darwin_time_t *t) {
+    time_t v = *t;
+    return conv_tm(localtime(&v), &tm_static);
 }
+static darwin_tm *d_gmtime(const darwin_time_t *t) {
+    time_t v = *t;
+    return conv_tm(gmtime(&v), &tm_static);
+}
+static darwin_tm *d_localtime_r(const darwin_time_t *t, darwin_tm *out) {
+    struct tm tmp;
+    time_t v = *t;
+    return conv_tm(localtime_r(&v, &tmp), out);
+}
+static darwin_time_t d_time(darwin_time_t *t) {
+    darwin_time_t v = (darwin_time_t)time(NULL);
+    if (t)
+        *t = v;
+    return v;
+}
+static int d_gettimeofday(int32_t *tv, void *tz) {
+    struct timeval v;
+    gettimeofday(&v, NULL);
+    if (tv)
+        tv[0] = (int32_t)v.tv_sec, tv[1] = (int32_t)v.tv_usec;
+    return 0;
+}
+static double d_difftime(darwin_time_t a, darwin_time_t b) { return (double)a - b; }
 
 static const char *machine = PORT_DEVICE_MACHINE;
 static int d_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
@@ -904,7 +978,7 @@ const import_entry darwin_imports[] = {
     V(_DefaultRuneLocale, &rune_locale), F(__maskrune, d___maskrune), F(__tolower, d___tolower),
     F(__toupper, d___toupper),
     // stdio / archivos
-    F(fopen, d_fopen), F(freopen, d_freopen), D(fclose), D(fread), F(fwrite, d_fwrite), D(fseek), D(ftell),
+    F(fopen, d_fopen), F(freopen, d_freopen), D(fclose), F(fread, d_fread), F(fwrite, d_fwrite), D(fseek), D(ftell),
     D(feof), D(ferror), D(fflush), F(fputs, d_fputs), D(fgets), D(fgetc), D(getc), D(fputc), D(putc), D(ungetc),
     D(fscanf), D(rewind), D(clearerr), D(fileno), D(setvbuf), D(tmpfile), F(fprintf, d_fprintf),
     F(vfprintf, d_vfprintf), F(printf, d_printf), F(vprintf, d_vprintf), F(puts, d_puts), F(putchar, d_putchar),
@@ -915,7 +989,7 @@ const import_entry darwin_imports[] = {
     D(write), D(lseek), V(__stderrp, &d_stderrp), V(__stdoutp, &d_stdoutp), V(__stdinp, &d_stdinp),
     F(getenv, d_getenv),
     // tiempo / sistema
-    D(gettimeofday), D(time), D(mktime), D(difftime), D(strftime), F(localtime, d_localtime),
+    F(gettimeofday, d_gettimeofday), F(time, d_time), D(mktime), F(difftime, d_difftime), D(strftime), F(localtime, d_localtime),
     F(gmtime, d_gmtime), F(localtime_r, d_localtime_r), F(clock, d_clock), F(usleep, d_usleep),
     F(nanosleep, d_nanosleep), F(sched_yield, d_sched_yield), F(mach_absolute_time, d_mach_absolute_time),
     F(mach_timebase_info, d_mach_timebase_info), F(sysctlbyname, d_sysctlbyname), F(sysctl, d_sysctl),
