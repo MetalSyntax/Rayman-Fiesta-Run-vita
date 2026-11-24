@@ -45,7 +45,7 @@ include_directories(
 )
 
 # -ffixed-r9: Darwin usa r9 como temporal sin guardarlo; nuestro código no debe tocarlo.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -O2 -g -ffixed-r9 -mfloat-abi=softfp -DSKIP_SPLASHSCREEN -Wall -Wno-unused-function -Wno-pointer-sign -D_GNU_SOURCE")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -Wl,--no-warn-mismatch -O2 -g -ffixed-r9 -mfloat-abi=softfp -DSKIP_SPLASHSCREEN -Wall -Wno-unused-function -Wno-pointer-sign -D_GNU_SOURCE")
 set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -ffixed-r9 -mfloat-abi=softfp")
 
 add_executable(${CMAKE_PROJECT_NAME}
@@ -68,7 +68,12 @@ add_executable(${CMAKE_PROJECT_NAME}
   source/cxx_imports.c
   source/ios5.c
   source/patch.c
+  source/hardfp_bridge.c
 )
+
+# Puente softfp -> hardfp para librerías de VitaSDK 2026.08 (sin --wrap para no romper libvorbis/libopenal).
+set_source_files_properties(source/hardfp_bridge.c PROPERTIES COMPILE_FLAGS "-mfloat-abi=hard")
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-Wl,--wrap=sincosf_c")
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
   -Wl,--whole-archive pthread -Wl,--no-whole-archive

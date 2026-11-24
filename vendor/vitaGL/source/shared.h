@@ -681,11 +681,16 @@ typedef enum {
 #endif
 
 // VBO struct
+#define VBO_RING_SIZE (FRAME_PURGE_FREQ + 1)
 typedef struct {
 	void *ptr;
 	int32_t size;
 	void *(*alloc_func)(size_t);
 	uint32_t last_frame;
+	void *ring_ptr[VBO_RING_SIZE];
+	int32_t ring_cap[VBO_RING_SIZE];
+	uint32_t ring_frame[VBO_RING_SIZE];
+	uint8_t ring_idx;
 #if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
 	GLboolean scratch;
 #endif

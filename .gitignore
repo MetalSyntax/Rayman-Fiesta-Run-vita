@@ -1,8 +1,9 @@
-# macOS metadata
+# OS metadata (macOS / Windows WSL)
 .DS_Store
 ._*
 .Spotlight-V100
 .Trashes
+*:Zone.Identifier
 
 # iOS IPA / App original y extracción -- nunca commitear el juego (anti-DMCA)
 *.ipa

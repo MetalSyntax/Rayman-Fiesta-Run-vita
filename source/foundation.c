@@ -339,8 +339,10 @@ static int s_caseInsensitiveCompare(id self, SEL _c, id o) {
 }
 static int s_intValue(id self, SEL _c) { return atoi(ns_cstr(self)); }
 static long long s_longLongValue(id self, SEL _c) { return atoll(ns_cstr(self)); }
-static float s_floatValue(id self, SEL _c) { return strtof(ns_cstr(self), NULL); }
-static double s_doubleValue(id self, SEL _c) { return strtod(ns_cstr(self), NULL); }
+extern float sfp_strtof(const char *, char **);
+extern double sfp_strtod(const char *, char **);
+static float s_floatValue(id self, SEL _c) { return sfp_strtof(ns_cstr(self), NULL); }
+static double s_doubleValue(id self, SEL _c) { return sfp_strtod(ns_cstr(self), NULL); }
 static int s_boolValue(id self, SEL _c) {
     const char *s = ns_cstr(self);
     while (*s == ' ')
@@ -1639,7 +1641,7 @@ static int ud_integerForKey(id self, SEL _c, id k) {
 static int ud_boolForKey(id self, SEL _c, id k) { return ud_integerForKey(self, _c, k) != 0; }
 static float ud_floatForKey(id self, SEL _c, id k) {
     id v = ns_dict_get(defaults_dict, k);
-    return !v ? 0 : objc_is_kind(v, c_NSNumber) ? (float)num_d(v) : strtof(ns_cstr(v), NULL);
+    return !v ? 0 : objc_is_kind(v, c_NSNumber) ? (float)num_d(v) : sfp_strtof(ns_cstr(v), NULL);
 }
 static double ud_doubleForKey(id self, SEL _c, id k) { return ud_floatForKey(self, _c, k); }
 static void ud_setInteger(id self, SEL _c, int v, id k) { ns_dict_set(defaults_dict, k, AR(num_new(0, v, 0))); }
@@ -1882,10 +1884,9 @@ const char *objc_describe(void *o) {
 
 // ================================================================ tiempo: NSDate, NSTimer, run loop
 
+extern int64_t ml_epoch_us(void);
 double ns_now(void) { // segundos desde 2001-01-01 (CFAbsoluteTime)
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec - 978307200.0 + tv.tv_usec / 1e6;
+    return ml_epoch_us() / 1e6 - 978307200.0;
 }
 static double mono(void) { return sceKernelGetProcessTimeWide() / 1e6; }
 
@@ -2018,6 +2019,7 @@ double ns_run_timers(void) {
             objc_pool_push();
             objc_msg(t->target, t->sel, (uint32_t)(t->repeats == 2 ? t->userInfo : (id)t), 0, 0, 0);
             objc_pool_pop();
+            now = mono(); // el callback (p. ej. drawFrame) pudo tardar más que t->interval
         }
         if (t->valid && t->next - now < wait)
             wait = t->next - now;

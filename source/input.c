@@ -46,6 +46,7 @@ static struct {
     float x, y; // lógicas (lo que se ve)
 } binds[MAX_BIND];
 static int nbinds;
+int port_logs;
 
 static void load_controls(void) {
     FILE *f = fopen(DATA_PATH "controls.txt", "r");
@@ -55,13 +56,21 @@ static void load_controls(void) {
     }
     char line[96], n[32];
     float x, y;
-    while (fgets(line, sizeof(line), f) && nbinds < MAX_BIND)
-        if (line[0] != '#' && sscanf(line, "%31s %f %f", n, &x, &y) == 3)
+    int lv;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#')
+            continue;
+        if (sscanf(line, "LOGS %d", &lv) == 1) {
+            port_logs = lv != 0;
+            continue;
+        }
+        if (nbinds < MAX_BIND && sscanf(line, "%31s %f %f", n, &x, &y) == 3)
             for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++)
                 if (!strcmp(n, names[i].name))
                     binds[nbinds++] = (typeof(binds[0])){names[i].mask, x, y};
+    }
     fclose(f);
-    l_info("controls.txt: %d botones", nbinds);
+    l_info("controls.txt: %d botones (logs=%d)", nbinds, port_logs);
 }
 
 void input_init(void) {
@@ -145,6 +154,14 @@ void input_poll(void) {
             fingers[k].id = t.report[i].id;
             fingers[k].moving = 0;
             fingers[k].x0 = vx, fingers[k].y0 = vy;
+            if (port_logs) {
+                int dx, dy, dw, dh;
+                float lw, lh;
+                gles_dest_rect(&dx, &dy, &dw, &dh);
+                logical_size(&lw, &lh);
+                l_info("touch: %d %d", (int)(((t.report[i].x / 2 - dx) / (float)dw) * lw),
+                       (int)(((t.report[i].y / 2 - dy) / (float)dh) * lh));
+            }
             ui_touch_event(k, 0, vx, vy);
         } else {
             float dx = vx - fingers[k].x0, dy = vy - fingers[k].y0;

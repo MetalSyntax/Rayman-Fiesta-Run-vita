@@ -89,6 +89,24 @@ uintptr_t macho_thunk(uint32_t ip_value, void *jump) {
     return addr;
 }
 
+// Reemplaza los primeros 8 bytes (no PC-relativos, alineados a 4) de una función Thumb en vm
+// con "ldr.w pc, [pc, #0]; .word thunk" y devuelve un trampoline Thumb que ejecuta los 8 bytes
+// originales y continúa en vm + 8.
+uintptr_t macho_hook_thumb8(uint32_t vm, void *hook) {
+    if (thunk_head + 4 > thunk_end)
+        fatal_error("arena de thunks llena");
+    uint32_t w0 = macho_read_text(vm), w1 = macho_read_text(vm + 4);
+    uint32_t tramp[4] = {w0, w1, 0xF000F8DFu, (MACHO_SLIDE + vm + 8u) | 1u};
+    uintptr_t tramp_addr = (uintptr_t)thunk_head;
+    kuKernelCpuUnrestrictedMemcpy(thunk_head, tramp, sizeof(tramp));
+    kuKernelFlushCaches(thunk_head, sizeof(tramp));
+    thunk_head += 4;
+    uintptr_t dst = macho_thunk((uint32_t)hook, ml_align_call);
+    uint32_t jmp[2] = {0xF000F8DFu, (uint32_t)dst};
+    macho_patch_text(vm, jmp, sizeof(jmp));
+    return tramp_addr | 1u;
+}
+
 static uintptr_t make_unimpl_thunk(const char *name) {
     unimpl_names = realloc(unimpl_names, (unimpl_count + 1) * sizeof(char *));
     unimpl_names[unimpl_count] = name;

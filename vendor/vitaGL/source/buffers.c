@@ -295,8 +295,10 @@ inline __attribute__((always_inline)) void glGenBuffers(GLsizei n, GLuint *res) 
 		if (!gpu_buf)
 			vgl_log("%s:%d glGenBuffers failed to alloc a buffer (%d/%lu).\n", __FILE__, __LINE__, i, n);
 #endif
-		gpu_buf->ptr = NULL;
+		vgl_memset(gpu_buf, 0, sizeof(vbo));
 		gpu_buf->last_frame = OBJ_NOT_USED;
+		for (int s = 0; s < VBO_RING_SIZE; s++)
+			gpu_buf->ring_frame[s] = OBJ_NOT_USED;
 		res[i] = (GLuint)gpu_buf;
 	}
 }
@@ -339,21 +341,26 @@ void glDeleteBuffers(GLsizei n, const GLuint *gl_buffers) {
 	for (int j = 0; j < n; j++) {
 		if (gl_buffers[j]) {
 			vbo *gpu_buf = (vbo *)gl_buffers[j];
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-			if (gpu_buf->ptr && !gpu_buf->scratch) {
-#else
-			if (gpu_buf->ptr) {
-#endif
-				if (gpu_buf->last_frame != OBJ_NOT_USED && (vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ)) {
-					mark_as_dirty(gpu_buf->ptr);
-				} else {
-					vgl_free(gpu_buf->ptr);
+			uint8_t cur = gpu_buf->ring_idx;
+			gpu_buf->ring_frame[cur] = gpu_buf->last_frame;
+			for (int s = 0; s < VBO_RING_SIZE; s++) {
+				if (gpu_buf->ring_ptr[s]) {
+					if (gpu_buf->ring_frame[s] != OBJ_NOT_USED && (vgl_framecount - gpu_buf->ring_frame[s] <= FRAME_PURGE_FREQ)) {
+						mark_as_dirty(gpu_buf->ring_ptr[s]);
+					} else {
+						vgl_free(gpu_buf->ring_ptr[s]);
+					}
 				}
 			}
 			vgl_free(gpu_buf);
 		}
 	}
 }
+
+// Contadores de perfilado para diagnóstico de cuellos de botella en VBOs
+uint32_t vgl_prof_vbo_reuse = 0;
+uint32_t vgl_prof_vbo_alloc = 0;
+uint32_t vgl_prof_vbo_dirty = 0;
 
 inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLenum usage) {
 	THREAD_SAFE()
@@ -370,60 +377,68 @@ inline void glNamedBufferData(GLuint buffer, GLsizei size, const void *data, GLe
 		return;
 	}
 #endif
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-	GLboolean was_scratch = gpu_buf->scratch;
-#endif
 	switch (usage) {
 	case GL_STREAM_DRAW:
 	case GL_STREAM_COPY:
 	case GL_STREAM_READ:
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-		gpu_buf->scratch = vgl_stream_wants_scratch;
-#endif
-		gpu_buf->alloc_func = gpu_alloc_mapped_for_cpu;
-		break;
 	case GL_DYNAMIC_DRAW:
 	case GL_DYNAMIC_READ:
 	case GL_DYNAMIC_COPY:
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-		gpu_buf->scratch = vgl_dynamic_wants_scratch;
-#endif
 		gpu_buf->alloc_func = gpu_alloc_mapped_for_cpu;
 		break;
 	default:
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-		gpu_buf->scratch = GL_FALSE;
-#endif
-		gpu_buf->alloc_func = gpu_alloc_mapped_for_gpu;
+		gpu_buf->alloc_func = gpu_buf->ring_ptr[0] ? gpu_alloc_mapped_for_cpu : gpu_alloc_mapped_for_gpu;
 		break;
 	}
 
-	// Marking previous content for deletion or deleting it straight if unused
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-	if (gpu_buf->ptr && !was_scratch) {
-#else
-	if (gpu_buf->ptr) {
-#endif
-		if (gpu_buf->last_frame != OBJ_NOT_USED && (vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ)) {
-			mark_as_dirty(gpu_buf->ptr);
-		} else {
-			vgl_free(gpu_buf->ptr);
+	uint8_t s = gpu_buf->ring_idx;
+	gpu_buf->ring_frame[s] = gpu_buf->last_frame;
+
+	// Si el slot actual fue usado recientemente por la GPU, rotamos al siguiente slot del anillo
+	// (solo para buffers <= 128 KB para no multiplicar RAM en mallas grandes).
+	if (gpu_buf->last_frame != OBJ_NOT_USED && (vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ)) {
+		if (size <= 131072) {
+			s = (s + 1) % VBO_RING_SIZE;
+			gpu_buf->ring_idx = s;
 		}
 	}
 
-	// Allocating a new buffer
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-	if (gpu_buf->scratch)
-		gpu_buf->ptr = vgl_reserve_data_pool(size);
-	else
-#endif
-		gpu_buf->ptr = gpu_buf->alloc_func(size);	
-
-#ifndef SKIP_ERROR_HANDLING
-	if (!gpu_buf->ptr) {
-		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+	// Si el slot elegido todavía está en vuelo en la GPU o es más chico que size, no se puede pisar:
+	// lo liberamos (mark_as_dirty si está en vuelo) y asignamos uno nuevo.
+	if (gpu_buf->ring_ptr[s]) {
+		GLboolean in_flight = gpu_buf->ring_frame[s] != OBJ_NOT_USED && (vgl_framecount - gpu_buf->ring_frame[s] <= FRAME_PURGE_FREQ);
+		if (in_flight || gpu_buf->ring_cap[s] < size) {
+			if (in_flight) {
+				mark_as_dirty(gpu_buf->ring_ptr[s]);
+				vgl_prof_vbo_dirty++;
+			} else {
+				vgl_free(gpu_buf->ring_ptr[s]);
+			}
+			gpu_buf->ring_ptr[s] = NULL;
+			gpu_buf->ring_cap[s] = 0;
+		} else {
+			vgl_prof_vbo_reuse++;
+		}
 	}
+
+	if (!gpu_buf->ring_ptr[s]) {
+		gpu_buf->ring_ptr[s] = gpu_buf->alloc_func(size);
+		gpu_buf->ring_cap[s] = gpu_buf->ring_ptr[s] ? size : 0;
+		vgl_prof_vbo_alloc++;
+	}
+
+	gpu_buf->ptr = gpu_buf->ring_ptr[s];
+	gpu_buf->ring_frame[s] = OBJ_NOT_USED;
+
+	if (!gpu_buf->ptr) {
+#ifndef SKIP_ERROR_HANDLING
+		SET_GL_ERROR(GL_OUT_OF_MEMORY)
+#else
+		gpu_buf->size = 0;
+		gpu_buf->last_frame = OBJ_NOT_USED;
+		return;
 #endif
+	}
 
 	gpu_buf->size = size;
 	gpu_buf->last_frame = OBJ_NOT_USED;
@@ -470,20 +485,35 @@ inline void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size
 #endif
 
 #ifndef BUFFERS_SPEEDHACK
-	// Allocating a new buffer
+	// Allocating or rotating to a free ring slot if the buffer was used recently
 	if (gpu_buf->last_frame != OBJ_NOT_USED && (vgl_framecount - gpu_buf->last_frame <= FRAME_PURGE_FREQ)) {
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-		uint8_t *ptr = gpu_buf->scratch ? vgl_reserve_data_pool(gpu_buf->size) : gpu_buf->alloc_func(gpu_buf->size);
-#else
-		uint8_t *ptr = gpu_buf->alloc_func(gpu_buf->size);
-#endif
+		uint8_t prev_s = gpu_buf->ring_idx;
+		gpu_buf->ring_frame[prev_s] = gpu_buf->last_frame;
+		uint8_t s = (prev_s + 1) % VBO_RING_SIZE;
+		gpu_buf->ring_idx = s;
+		if (gpu_buf->ring_ptr[s]) {
+			GLboolean in_flight = gpu_buf->ring_frame[s] != OBJ_NOT_USED && (vgl_framecount - gpu_buf->ring_frame[s] <= FRAME_PURGE_FREQ);
+			if (in_flight || gpu_buf->ring_cap[s] < gpu_buf->size) {
+				if (in_flight)
+					mark_as_dirty(gpu_buf->ring_ptr[s]);
+				else
+					vgl_free(gpu_buf->ring_ptr[s]);
+				gpu_buf->ring_ptr[s] = NULL;
+				gpu_buf->ring_cap[s] = 0;
+			}
+		}
+		if (!gpu_buf->ring_ptr[s]) {
+			gpu_buf->ring_ptr[s] = gpu_alloc_mapped_for_cpu(gpu_buf->size);
+			gpu_buf->ring_cap[s] = gpu_buf->ring_ptr[s] ? gpu_buf->size : 0;
+		}
+		uint8_t *ptr = (uint8_t *)gpu_buf->ring_ptr[s];
 
-#ifdef LOG_ERRORS
 		if (!ptr) {
+#ifdef LOG_ERRORS
 			vgl_log("%s:%d glBufferSubData failed to alloc a buffer of %ld bytes. Buffer content won't be updated.\n", __FILE__, __LINE__, gpu_buf->size);
+#endif
 			return;
 		}
-#endif
 
 		// Copying up previous data combined to modified data
 		if (offset > 0)
@@ -492,13 +522,8 @@ inline void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size
 		if (gpu_buf->size - size - offset > 0)
 			vgl_memcpy(ptr + offset + size, (uint8_t *)gpu_buf->ptr + offset + size, gpu_buf->size - size - offset);
 
-		// Marking previous content for deletion
-#if defined(HAVE_SCRATCH_MEMORY) && !defined(DISABLE_CIRCULAR_POOL)
-		if (!gpu_buf->scratch)
-#endif
-			mark_as_dirty(gpu_buf->ptr);
-
 		gpu_buf->ptr = ptr;
+		gpu_buf->ring_frame[s] = OBJ_NOT_USED;
 		gpu_buf->last_frame = OBJ_NOT_USED;
 	} else
 #endif

@@ -12,5 +12,6 @@ int gles_rotation(void);                   // 0 sin girar, 1 landscape-right, 2 
 void gles_dest_rect(int *x, int *y, int *w, int *h);
 uint32_t gles_get_draw_calls(void);
 void gles_take_prof(uint32_t ms[3]); // ms en draws, buffers, texturas desde la última llamada
+void gles_take_prof_ext(uint32_t out[8]); // [0..2]=ms draws/buf/tex, [3]=buf_calls, [4]=buf_kb, [5]=draw_elems, [6]=draw_arrs, [7]=verts_k
 uint64_t gles_take_swap_us(void); // tiempo en vglSwapBuffers desde la última llamada
 int ime_active(void);

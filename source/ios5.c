@@ -523,8 +523,9 @@ typedef struct {
 // abierto solo mientras el reproductor suena.
 static int avp_thread(SceSize args, void *argp) {
     av_player *p = *(av_player **)argp;
-    int ch = p->fmt.mChannelsPerFrame, port = -1;
-    int16_t *in = malloc(AVP_GRAIN * ch * 2), out[AVP_GRAIN * 2];
+    int ch = p->fmt.mChannelsPerFrame, port = -1, bi = 0;
+    int16_t *in = malloc(AVP_GRAIN * ch * 2);
+    int16_t *out[2] = {malloc(AVP_GRAIN * 4), malloc(AVP_GRAIN * 4)};
     while (!p->quit) {
         if (!p->playing) {
             if (port >= 0)
@@ -544,11 +545,13 @@ static int avp_thread(SceSize args, void *argp) {
         long got = af_read_frames(p->af, p->pos, AVP_GRAIN, in);
         p->pos += got;
         int v = (int)(p->vol * 32768);
+        int16_t *dst = out[bi];
         for (long i = 0; i < AVP_GRAIN; i++) {
             int l = i < got ? in[i * ch] : 0, r = i < got ? in[i * ch + (ch > 1)] : 0;
-            out[i * 2] = l * v >> 15, out[i * 2 + 1] = r * v >> 15;
+            dst[i * 2] = l * v >> 15, dst[i * 2 + 1] = r * v >> 15;
         }
-        sceAudioOutOutput(port, out);
+        sceAudioOutOutput(port, dst);
+        bi ^= 1;
         if (got < AVP_GRAIN) { // fin del tema
             p->pos = 0;
             if (p->loops > 0)
@@ -559,6 +562,8 @@ static int avp_thread(SceSize args, void *argp) {
     }
     if (port >= 0)
         sceAudioOutReleasePort(port);
+    free(out[0]);
+    free(out[1]);
     free(in);
     return 0;
 }

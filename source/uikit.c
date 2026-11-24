@@ -437,7 +437,8 @@ static void accel_tick(void) {
     float sx, sy;
     input_stick(&sx, &sy);
     double roll = sx * 0.6, pitch = 0.5 + sy * 0.5; // 0,5 rad = como se sostiene el teléfono
-    double gx = sin(roll) * cos(pitch), gy = -cos(roll) * cos(pitch), gz = -sin(pitch);
+    extern double sfp_sin(double), sfp_cos(double);
+    double gx = sfp_sin(roll) * sfp_cos(pitch), gy = -sfp_cos(roll) * sfp_cos(pitch), gz = -sfp_sin(pitch);
     ui_accel *a = objc_alloc(c_UIAcceleration);
     switch (gles_rotation()) {
     case 1: // landscape-right: +y del iPhone = izquierda de la pantalla, +x = arriba
@@ -757,8 +758,9 @@ static void cg_ScaleCTM(cg_ctx *c, float sx, float sy) {
     c->ctm.a *= sx, c->ctm.b *= sx, c->ctm.c *= sy, c->ctm.d *= sy;
 }
 static void cg_RotateCTM(cg_ctx *c, float r) {
+    extern float sfp_sinf(float), sfp_cosf(float);
     CGAffineTransform m = c->ctm;
-    float s = sinf(r), k = cosf(r);
+    float s = sfp_sinf(r), k = sfp_cosf(r);
     c->ctm.a = m.a * k + m.c * s, c->ctm.b = m.b * k + m.d * s;
     c->ctm.c = m.c * k - m.a * s, c->ctm.d = m.d * k - m.b * s;
 }
@@ -850,14 +852,17 @@ static cg_image *cg_BitmapCreateImage(cg_ctx *c) {
     return img_new(c->w, c->h, px, (c->info & 0x1F) <= 2);
 }
 static void cg_AffineMakeRotation(CGAffineTransform *ret, float a) {
-    *ret = (CGAffineTransform){cosf(a), sinf(a), -sinf(a), cosf(a), 0, 0};
+    extern float sfp_sinf(float), sfp_cosf(float);
+    float s = sfp_sinf(a), k = sfp_cosf(a);
+    *ret = (CGAffineTransform){k, s, -s, k, 0, 0};
 }
 static void cg_AffineMakeTranslation(CGAffineTransform *ret, float x, float y) {
     *ret = (CGAffineTransform){1, 0, 0, 1, x, y};
 }
 static void cg_AffineMakeScale(CGAffineTransform *ret, float x, float y) { *ret = (CGAffineTransform){x, 0, 0, y, 0, 0}; }
 static void cg_AffineRotate(CGAffineTransform *ret, CGAffineTransform t, float a) {
-    float s = sinf(a), k = cosf(a);
+    extern float sfp_sinf(float), sfp_cosf(float);
+    float s = sfp_sinf(a), k = sfp_cosf(a);
     *ret = (CGAffineTransform){t.a * k + t.c * s, t.b * k + t.d * s, t.c * k - t.a * s, t.d * k - t.b * s, t.tx, t.ty};
 }
 static void cg_RectOffset(CGRect *ret, CGRect r, float dx, float dy) {
@@ -1277,6 +1282,10 @@ static void gvc_tick(id self, SEL _c, id timer) {
         MSG1(g->delegate, "glkViewControllerUpdate:", self);
     else if (objc_responds(self, sel_registerName("update")))
         MSG0(self, "update");
+    if (game_presents) { // el juego ya dibuja y presenta desde CADisplayLink
+        glk_skipped++;
+        return;
+    }
     id view = VX(self)->layer;
     if (view && objc_is_kind(view, c_GLKView)) {
         if (!GX(view)->delegate)
@@ -1533,25 +1542,56 @@ void ui_runloop_tick(double max_wait) {
 }
 
 extern uint64_t ml_io_us;
+extern uint32_t vgl_prof_vbo_reuse, vgl_prof_vbo_alloc, vgl_prof_vbo_dirty;
+extern void patch_take_bez_stats(uint32_t *hits, uint32_t *misses);
+extern int port_logs;
 void ui_runloop_forever(void) {
-    static uint64_t last_log;
+    static uint64_t last_log, last_tick;
+    static uint32_t max_frame_us;
     l_info("run loop principal");
     for (;;) {
+        uint64_t t0 = port_logs ? sceKernelGetProcessTimeWide() : 0;
         objc_pool_push();
         ui_runloop_tick(0.02);
         objc_pool_pop();
+        if (!port_logs)
+            continue;
         uint64_t now = sceKernelGetProcessTimeWide();
-        if (now - last_log > 10 * 1000000ULL) {
-            static uint32_t last_frames;
-            uint32_t prof[3];
-            gles_take_prof(prof);
-            l_info("vivo: %u frames presentados (%u del juego, %u GLKView omitidos), %u draw calls; %u ms en swap "
-                   "(%u frames en 10 s), %u ms en drawFrame, %u ms en E/S; GL: %u ms draws, %u ms buffers, %u ms texturas",
-                   (unsigned)frames, (unsigned)game_presents, (unsigned)glk_skipped, (unsigned)gles_get_draw_calls(),
-                   (unsigned)(gles_take_swap_us() / 1000), (unsigned)(frames - last_frames), (unsigned)(dl_us / 1000),
-                   (unsigned)(ml_io_us / 1000), (unsigned)prof[0], (unsigned)prof[1], (unsigned)prof[2]);
+        if (last_tick) {
+            uint32_t f_us = (uint32_t)(now - t0);
+            if (f_us > max_frame_us)
+                max_frame_us = f_us;
+        }
+        last_tick = now;
+        if (now - last_log > 5 * 1000000ULL) {
+            static uint32_t last_frames, last_dc;
+            uint32_t dt_ms = last_log ? (uint32_t)((now - last_log) / 1000) : 5000;
+            uint32_t df = frames - last_frames;
+            uint32_t ddc = gles_get_draw_calls() - last_dc;
+            uint32_t p[8], bh = 0, bm = 0;
+            gles_take_prof_ext(p);
+            patch_take_bez_stats(&bh, &bm);
+            uint32_t swap_ms = (uint32_t)(gles_take_swap_us() / 1000);
+            uint32_t dl_ms = (uint32_t)(dl_us / 1000);
+            uint32_t io_ms = (uint32_t)(ml_io_us / 1000);
+            uint32_t gl_ms = p[0] + p[1] + p[2];
+            int32_t cpu_game_ms = (int32_t)dl_ms - (int32_t)swap_ms - (int32_t)gl_ms - (int32_t)io_ms;
+            if (cpu_game_ms < 0)
+                cpu_game_ms = 0;
+            float fps = dt_ms ? (df * 1000.0f / dt_ms) : 0.0f;
+            float ms_f = df ? ((float)dt_ms / df) : 0.0f;
+            l_info("PERF: %.1f fps (%.1f ms/f, max=%.1f) | game_cpu=%u ms (%.1f ms/f) gl=%u ms [draw=%u buf=%u tex=%u] swap=%u ms io=%u ms | "
+                   "dc/f=%u (elem=%u arr=%u verts=%uk) | vbo: calls=%u (%u KB) reuse=%u alloc=%u dirty=%u | bez: hit=%u miss=%u",
+                   fps, ms_f, max_frame_us / 1000.0f, (unsigned)cpu_game_ms, df ? (float)cpu_game_ms / df : 0.0f, (unsigned)gl_ms,
+                   (unsigned)p[0], (unsigned)p[1], (unsigned)p[2], (unsigned)swap_ms, (unsigned)io_ms,
+                   df ? (unsigned)(ddc / df) : 0, (unsigned)p[5], (unsigned)p[6], (unsigned)p[7],
+                   (unsigned)p[3], (unsigned)p[4], (unsigned)vgl_prof_vbo_reuse, (unsigned)vgl_prof_vbo_alloc,
+                   (unsigned)vgl_prof_vbo_dirty, (unsigned)bh, (unsigned)bm);
+            vgl_prof_vbo_reuse = vgl_prof_vbo_alloc = vgl_prof_vbo_dirty = 0;
             dl_us = ml_io_us = 0;
+            max_frame_us = 0;
             last_frames = frames;
+            last_dc = gles_get_draw_calls();
             last_log = now;
         }
     }

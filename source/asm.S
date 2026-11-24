@@ -56,6 +56,12 @@ call_guest6:
 @ El ABI de iOS ARMv6 solo garantiza pila alineada a 4; el código de la Vita (newlib, vitaGL)
 @ asume 8 (AAPCS) y falla con pila desalineada (NEON con alineación, va_arg de 64 bits). Si sp
 @ está desalineado, se arma un marco alineado copiando 16 palabras de argumentos de pila.
+@ No-op directo para _Unwind_SjLj_Register/Unregister sin pasar por ml_align_call.
+    .global ml_sjlj_noop
+    .type ml_sjlj_noop, %function
+ml_sjlj_noop:
+    bx      lr
+
     .global ml_align_call
     .type ml_align_call, %function
 ml_align_call:

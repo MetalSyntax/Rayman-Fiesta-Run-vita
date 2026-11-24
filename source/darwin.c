@@ -526,17 +526,21 @@ static darwin_tm *d_localtime_r(const darwin_time_t *t, darwin_tm *out) {
     time_t v = *t;
     return conv_tm(localtime_r(&v, &tmp), out);
 }
+static int64_t base_epoch_us;
+int64_t ml_epoch_us(void) { return base_epoch_us + (int64_t)sceKernelGetProcessTimeWide(); }
+
 static darwin_time_t d_time(darwin_time_t *t) {
-    darwin_time_t v = (darwin_time_t)time(NULL);
+    darwin_time_t v = (darwin_time_t)(ml_epoch_us() / 1000000LL);
     if (t)
         *t = v;
     return v;
 }
 static int d_gettimeofday(int32_t *tv, void *tz) {
-    struct timeval v;
-    gettimeofday(&v, NULL);
-    if (tv)
-        tv[0] = (int32_t)v.tv_sec, tv[1] = (int32_t)v.tv_usec;
+    if (tv) {
+        int64_t us = ml_epoch_us();
+        tv[0] = (int32_t)(us / 1000000LL);
+        tv[1] = (int32_t)(us % 1000000LL);
+    }
     return 0;
 }
 static double d_difftime(darwin_time_t a, darwin_time_t b) { return (double)a - b; }
@@ -558,7 +562,7 @@ static int d_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *n
     }
     if (!strcmp(name, "hw.ncpu") || !strcmp(name, "hw.cpufrequency")) {
         if (oldp && *oldlenp >= 4)
-            *(uint32_t *)oldp = name[3] == 'n' ? 1 : 600000000;
+            *(uint32_t *)oldp = name[3] == 'n' ? 2 : 1000000000;
         *oldlenp = 4;
         return 0;
     }
@@ -635,12 +639,20 @@ static int d_select(int n, void *r, void *w, void *e, void *t) { return 0; }
 typedef struct {
     uint32_t sig;
     pthread_mutex_t m;
+    uint32_t owner;
+    uint32_t count;
 } d_mutex;
 typedef struct {
     uint32_t sig;
     int type;
 } d_mutexattr;
 static pthread_mutex_t lazy_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint32_t fast_tid(void) {
+    uint32_t t;
+    __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(t));
+    return t;
+}
 
 static int d_pthread_mutexattr_init(d_mutexattr *a) {
     a->sig = ML_MUTEXATTR_SIG;
@@ -652,14 +664,11 @@ static int d_pthread_mutexattr_settype(d_mutexattr *a, int type) {
     return 0;
 }
 static int d_pthread_mutex_init(d_mutex *m, const d_mutexattr *a) {
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    int type = a && a->sig == ML_MUTEXATTR_SIG ? a->type : 0;
-    // ponytail: NORMAL se crea recursivo; un juego que se re-bloquea por error en iOS se colgaría
-    // igual, pero los mutex "normales" de Darwin no detectan nada y algunos juegos dependen de eso.
-    pthread_mutexattr_settype(&attr, type == 1 ? PTHREAD_MUTEX_ERRORCHECK : PTHREAD_MUTEX_RECURSIVE);
-    int r = pthread_mutex_init(&m->m, &attr);
-    pthread_mutexattr_destroy(&attr);
+    // PTHREAD_MUTEX_NORMAL en libpthread evita pthread_self()/TLS en cada lock/unlock;
+    // la recursividad se lleva en m->owner/m->count con TPIDRURO (1 instrucción).
+    int r = pthread_mutex_init(&m->m, NULL);
+    m->owner = 0;
+    m->count = 0;
     m->sig = ML_MUTEX_SIG;
     return r;
 }
@@ -675,21 +684,50 @@ static void mutex_lazy(d_mutex *m) {
     pthread_mutex_unlock(&lazy_lock);
 }
 static int d_pthread_mutex_lock(d_mutex *m) {
-    mutex_lazy(m);
-    return pthread_mutex_lock(&m->m);
+    if (__builtin_expect(m->sig != ML_MUTEX_SIG, 0))
+        mutex_lazy(m);
+    uint32_t self = fast_tid();
+    if (m->owner == self) {
+        m->count++;
+        return 0;
+    }
+    int r = pthread_mutex_lock(&m->m);
+    if (!r) {
+        m->owner = self;
+        m->count = 1;
+    }
+    return r;
 }
 static int d_pthread_mutex_trylock(d_mutex *m) {
-    mutex_lazy(m);
-    return pthread_mutex_trylock(&m->m) ? 16 /* EBUSY de Darwin */ : 0;
+    if (__builtin_expect(m->sig != ML_MUTEX_SIG, 0))
+        mutex_lazy(m);
+    uint32_t self = fast_tid();
+    if (m->owner == self) {
+        m->count++;
+        return 0;
+    }
+    if (pthread_mutex_trylock(&m->m))
+        return 16; // EBUSY de Darwin
+    m->owner = self;
+    m->count = 1;
+    return 0;
 }
 static int d_pthread_mutex_unlock(d_mutex *m) {
-    mutex_lazy(m);
+    if (__builtin_expect(m->sig != ML_MUTEX_SIG, 0))
+        mutex_lazy(m);
+    if (m->owner == fast_tid()) {
+        if (--m->count > 0)
+            return 0;
+        m->owner = 0;
+    }
     return pthread_mutex_unlock(&m->m);
 }
 static int d_pthread_mutex_destroy(d_mutex *m) {
     if (m->sig != ML_MUTEX_SIG)
         return 0;
     m->sig = 0;
+    m->owner = 0;
+    m->count = 0;
     return pthread_mutex_destroy(&m->m);
 }
 
@@ -717,12 +755,24 @@ static int d_pthread_cond_init(d_cond *c, const void *a) {
 static int d_pthread_cond_wait(d_cond *c, d_mutex *m) {
     cond_lazy(c);
     mutex_lazy(m);
-    return pthread_cond_wait(&c->c, &m->m);
+    uint32_t self = fast_tid(), saved = m->count ? m->count : 1;
+    m->owner = 0;
+    m->count = 0;
+    int r = pthread_cond_wait(&c->c, &m->m);
+    m->owner = self;
+    m->count = saved;
+    return r;
 }
 static int d_pthread_cond_timedwait(d_cond *c, d_mutex *m, const struct timespec *t) {
     cond_lazy(c);
     mutex_lazy(m);
-    return pthread_cond_timedwait(&c->c, &m->m, t) ? 60 /* ETIMEDOUT de Darwin */ : 0;
+    uint32_t self = fast_tid(), saved = m->count ? m->count : 1;
+    m->owner = 0;
+    m->count = 0;
+    int r = pthread_cond_timedwait(&c->c, &m->m, t);
+    m->owner = self;
+    m->count = saved;
+    return r ? 60 /* ETIMEDOUT de Darwin */ : 0;
 }
 static int d_pthread_cond_signal(d_cond *c) {
     cond_lazy(c);
@@ -953,9 +1003,27 @@ static void d_CC_MD5(const void *data, uint32_t len, uint8_t *md) {
         md[i] = h >> ((i & 3) * 8);
 }
 
-// setjmp/longjmp en asm.S (sobre el jmp_buf de Darwin, sin pasar por ml_align_call)
+// setjmp/longjmp y sjlj_noop en asm.S (sin pasar por ml_align_call)
 extern int ml_setjmp(void *);
 extern void ml_longjmp(void *, int);
+extern void ml_sjlj_noop(void);
+// puente softfp -> hardfp en hardfp_bridge.c
+extern double sfp_atof(const char *), sfp_strtod(const char *, char **);
+extern float sfp_strtof(const char *, char **);
+extern float sfp_acosf(float), sfp_asinf(float), sfp_atanf(float), sfp_atan2f(float, float), sfp_cosf(float),
+    sfp_sinf(float), sfp_tanf(float), sfp_expf(float), sfp_exp2f(float), sfp_logf(float), sfp_log2f(float),
+    sfp_log10f(float), sfp_powf(float, float), sfp_sqrtf(float), sfp_cbrtf(float), sfp_floorf(float),
+    sfp_ceilf(float), sfp_fabsf(float), sfp_fmodf(float, float), sfp_roundf(float), sfp_rintf(float),
+    sfp_truncf(float), sfp_coshf(float), sfp_sinhf(float), sfp_tanhf(float), sfp_hypotf(float, float),
+    sfp_modff(float, float *);
+extern long sfp_lrintf(float), sfp_lroundf(float), sfp_lrint(double), sfp_lround(double);
+extern long long sfp_llrint(double);
+extern double sfp_acos(double), sfp_asin(double), sfp_atan(double), sfp_atan2(double, double), sfp_cos(double),
+    sfp_sin(double), sfp_tan(double), sfp_exp(double), sfp_log(double), sfp_log2(double), sfp_log10(double),
+    sfp_pow(double, double), sfp_sqrt(double), sfp_floor(double), sfp_ceil(double), sfp_fabs(double),
+    sfp_fmod(double, double), sfp_round(double), sfp_rint(double), sfp_trunc(double), sfp_ldexp(double, int),
+    sfp_frexp(double, int *), sfp_modf(double, double *), sfp_fmax(double, double), sfp_fmin(double, double),
+    sfp_hypot(double, double), sfp_cosh(double), sfp_sinh(double), sfp_tanh(double);
 
 // ---------------------------------------------------------------- tabla
 
@@ -965,7 +1033,7 @@ const import_entry darwin_imports[] = {
     D(memccpy), D(bzero), D(strlen), D(strnlen), D(strcmp), D(strncmp), D(strcpy), D(strncpy), D(strcat),
     D(strncat), D(strchr), D(strrchr), D(strstr), D(strtok), D(strtok_r), D(strdup), D(strcasecmp),
     D(strncasecmp), D(strlcpy), D(strlcat), D(strspn), D(strcspn), D(strpbrk), D(strerror), D(atoi), D(atol),
-    D(atoll), D(atof), D(strtol), D(strtoul), D(strtoll), D(strtoull), D(strtod), D(strtof), D(rand), D(srand),
+    D(atoll), F(atof, sfp_atof), D(strtol), D(strtoul), D(strtoll), D(strtoull), F(strtod, sfp_strtod), F(strtof, sfp_strtof), D(rand), D(srand),
     D(random), D(srandom), D(abs), D(labs), D(wcslen), D(wcscpy), D(wcsncpy), D(wcscmp), D(wcsncmp), D(wcscat),
     D(wcschr), D(mbstowcs), D(wcstombs), D(towlower), D(towupper), D(tolower), D(toupper), D(isalpha), D(isdigit),
     D(isspace), D(isupper), D(islower), D(isalnum), D(isprint), D(ispunct), D(isxdigit), D(sscanf),
@@ -1034,7 +1102,7 @@ const import_entry darwin_imports[] = {
     F(__cxa_pure_virtual, d___cxa_pure_virtual), F(__cxa_allocate_exception, d___cxa_allocate_exception),
     F(__cxa_throw, d___cxa_throw), F(__cxa_rethrow, d_sjlj_resume), F(__cxa_begin_catch, d___cxa_begin_catch),
     F(__cxa_end_catch, d_noop), F(__cxa_free_exception, free), F(__gxx_personality_sj0, d_noop),
-    D(__dynamic_cast), F(_Unwind_SjLj_Register, d_sjlj_noop), F(_Unwind_SjLj_Unregister, d_sjlj_noop),
+    D(__dynamic_cast), V(_Unwind_SjLj_Register, ml_sjlj_noop), V(_Unwind_SjLj_Unregister, ml_sjlj_noop),
     F(_Unwind_SjLj_Resume, d_sjlj_resume), F(_Unwind_SjLj_RaiseException, d_sjlj_resume),
     // compiler-rt / libgcc (softfp = mismo ABI)
     F(__addsf3vfp, f_add), F(__subsf3vfp, f_sub), F(__mulsf3vfp, f_mul), F(__divsf3vfp, f_div),
@@ -1054,17 +1122,27 @@ const import_entry darwin_imports[] = {
     F(__divsi3, i_div), F(__modsi3, i_mod), F(__udivsi3, u_div), F(__umodsi3, u_mod), F(__divdi3, ll_div),
     F(__moddi3, ll_mod), F(__muldi3, ll_mul), F(__udivdi3, ull_div), F(__umoddi3, ull_mod), F(__cmpdi2, ll_cmp),
     F(__ucmpdi2, ull_cmp), F(__ashrdi3, ll_ashr), F(__ashldi3, ll_lshl), F(__lshrdi3, ll_lshr),
-    // math (softfp en los dos lados: directo)
-    D(acosf), D(asinf), D(atanf), D(atan2f), D(cosf), D(sinf), D(tanf), D(expf), D(logf), D(log10f), D(powf),
-    D(sqrtf), D(floorf), D(ceilf), D(fabsf), D(fmodf), D(roundf), D(lrintf), D(rintf), D(truncf), D(coshf),
-    D(sinhf), D(tanhf), D(acos), D(asin), D(atan), D(atan2), D(cos), D(sin), D(tan), D(exp), D(log), D(log2),
-    D(log10), D(pow), D(sqrt), D(floor), D(ceil), D(fabs), D(fmod), D(round), D(lrint), D(rint), D(trunc),
-    D(ldexp), D(frexp), D(modf), D(modff), D(fmax), D(fmin), D(hypot), D(hypotf), D(cosh), D(sinh), D(tanh),
-    D(log2f), D(exp2f), D(cbrtf), D(llrint), D(lround), D(lroundf), F(fmaxf, m_fmaxf), F(fminf, m_fminf),
+    // math (puente softfp -> hardfp de VitaSDK 2026.08 en hardfp_bridge.c)
+    F(acosf, sfp_acosf), F(asinf, sfp_asinf), F(atanf, sfp_atanf), F(atan2f, sfp_atan2f), F(cosf, sfp_cosf),
+    F(sinf, sfp_sinf), F(tanf, sfp_tanf), F(expf, sfp_expf), F(logf, sfp_logf), F(log10f, sfp_log10f),
+    F(powf, sfp_powf), F(sqrtf, sfp_sqrtf), F(floorf, sfp_floorf), F(ceilf, sfp_ceilf), F(fabsf, sfp_fabsf),
+    F(fmodf, sfp_fmodf), F(roundf, sfp_roundf), F(lrintf, sfp_lrintf), F(rintf, sfp_rintf), F(truncf, sfp_truncf),
+    F(coshf, sfp_coshf), F(sinhf, sfp_sinhf), F(tanhf, sfp_tanhf), F(acos, sfp_acos), F(asin, sfp_asin),
+    F(atan, sfp_atan), F(atan2, sfp_atan2), F(cos, sfp_cos), F(sin, sfp_sin), F(tan, sfp_tan), F(exp, sfp_exp),
+    F(log, sfp_log), F(log2, sfp_log2), F(log10, sfp_log10), F(pow, sfp_pow), F(sqrt, sfp_sqrt),
+    F(floor, sfp_floor), F(ceil, sfp_ceil), F(fabs, sfp_fabs), F(fmod, sfp_fmod), F(round, sfp_round),
+    F(lrint, sfp_lrint), F(rint, sfp_rint), F(trunc, sfp_trunc), F(ldexp, sfp_ldexp), F(frexp, sfp_frexp),
+    F(modf, sfp_modf), F(modff, sfp_modff), F(fmax, sfp_fmax), F(fmin, sfp_fmin), F(hypot, sfp_hypot),
+    F(hypotf, sfp_hypotf), F(cosh, sfp_cosh), F(sinh, sfp_sinh), F(tanh, sfp_tanh), F(log2f, sfp_log2f),
+    F(exp2f, sfp_exp2f), F(cbrtf, sfp_cbrtf), F(llrint, sfp_llrint), F(lround, sfp_lround), F(lroundf, sfp_lroundf),
+    F(fmaxf, m_fmaxf), F(fminf, m_fminf),
 };
 TABLE_END(darwin)
 
 void darwin_init(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    base_epoch_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec - (int64_t)sceKernelGetProcessTimeWide();
     d_stderrp = stderr;
     d_stdoutp = stdout;
     d_stdinp = stdin;

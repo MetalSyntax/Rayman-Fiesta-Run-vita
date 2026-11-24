@@ -30,16 +30,24 @@ static ALCdevice *al_OpenDevice(const ALCchar *name) {
     return d;
 }
 
+extern void sfp_alSourcef(ALuint, ALenum, ALfloat), sfp_alSource3f(ALuint, ALenum, ALfloat, ALfloat, ALfloat);
+extern void sfp_alListenerf(ALenum, ALfloat), sfp_alListener3f(ALenum, ALfloat, ALfloat, ALfloat);
+extern void sfp_alBufferf(ALuint, ALenum, ALfloat), sfp_alDopplerFactor(ALfloat), sfp_alDopplerVelocity(ALfloat),
+    sfp_alSpeedOfSound(ALfloat);
+extern ALfloat sfp_alGetFloat(ALenum);
+
 const import_entry openal_imports[] = {
-    D(alBufferData), D(alBufferf), D(alBufferi), D(alDeleteBuffers), D(alDeleteSources), D(alGenBuffers),
+    D(alBufferData), F(alBufferf, sfp_alBufferf), D(alBufferi), D(alDeleteBuffers), D(alDeleteSources), D(alGenBuffers),
     D(alGenSources), D(alGetError), D(alGetSourcei), D(alGetSourcef), D(alGetSourcefv), D(alGetSourceiv),
-    D(alGetSource3f), D(alGetBufferi), D(alGetBufferf), D(alListener3f), D(alListenerfv), D(alListenerf),
-    D(alListeneri), D(alGetListenerf), D(alGetListenerfv), D(alGetListener3f), D(alSource3f), D(alSource3i),
-    D(alSourcefv), D(alSourceiv), D(alSourcePause), D(alSourcePlay), D(alSourceQueueBuffers), D(alSourceRewind),
-    D(alSourceStop), D(alSourceUnqueueBuffers), D(alSourcef), D(alSourcei), D(alSourcePlayv), D(alSourceStopv),
-    D(alSourcePausev), D(alSourceRewindv), D(alIsSource), D(alIsBuffer), D(alGetString), D(alGetInteger),
-    D(alGetFloat), D(alGetBoolean), D(alDistanceModel), D(alDopplerFactor), D(alDopplerVelocity),
-    D(alSpeedOfSound), D(alEnable), D(alDisable), D(alIsEnabled), D(alIsExtensionPresent), D(alGetEnumValue),
+    D(alGetSource3f), D(alGetBufferi), D(alGetBufferf), F(alListener3f, sfp_alListener3f), D(alListenerfv),
+    F(alListenerf, sfp_alListenerf), D(alListeneri), D(alGetListenerf), D(alGetListenerfv), D(alGetListener3f),
+    F(alSource3f, sfp_alSource3f), D(alSource3i), D(alSourcefv), D(alSourceiv), D(alSourcePause), D(alSourcePlay),
+    D(alSourceQueueBuffers), D(alSourceRewind), D(alSourceStop), D(alSourceUnqueueBuffers), F(alSourcef, sfp_alSourcef),
+    D(alSourcei), D(alSourcePlayv), D(alSourceStopv), D(alSourcePausev), D(alSourceRewindv), D(alIsSource),
+    D(alIsBuffer), D(alGetString), D(alGetInteger), F(alGetFloat, sfp_alGetFloat), D(alGetBoolean), D(alDistanceModel),
+    F(alDopplerFactor, sfp_alDopplerFactor), F(alDopplerVelocity, sfp_alDopplerVelocity),
+    F(alSpeedOfSound, sfp_alSpeedOfSound), D(alEnable), D(alDisable), D(alIsEnabled), D(alIsExtensionPresent),
+    D(alGetEnumValue),
     D(alcCloseDevice), D(alcCreateContext), D(alcDestroyContext), D(alcGetContextsDevice), D(alcGetCurrentContext),
     D(alcMakeContextCurrent), D(alcProcessContext), D(alcSuspendContext), D(alcGetError), D(alcGetString),
     D(alcGetIntegerv), D(alcIsExtensionPresent), F(alcOpenDevice, al_OpenDevice),

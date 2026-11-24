@@ -316,7 +316,8 @@ static void notify_running(audio_queue *q) {
 
 static int aq_thread(SceSize args, void *argp) {
     audio_queue *q = *(audio_queue **)argp;
-    int16_t out[GRAIN * 2];
+    int16_t out_buf[2][GRAIN * 2];
+    int bi = 0;
     int ch = q->fmt.mChannelsPerFrame ? q->fmt.mChannelsPerFrame : 2;
     double step = q->fmt.mSampleRate / OUT_RATE;
     while (q->alive) {
@@ -324,6 +325,7 @@ static int aq_thread(SceSize args, void *argp) {
             sceKernelDelayThread(5000);
             continue;
         }
+        int16_t *out = out_buf[bi];
         int n = 0;
         while (n < GRAIN) {
             aq_lock(q);
@@ -357,6 +359,7 @@ static int aq_thread(SceSize args, void *argp) {
             }
         }
         sceAudioOutOutput(q->port, out);
+        bi ^= 1;
     }
     return 0;
 }
