@@ -20,7 +20,8 @@ extern char cxx_12 __asm__("_ZNSbIwSt11char_traitsIwESaIwEEC1EPKwRKS1_"); // std
 extern char cxx_13 __asm__("_ZNSbIwSt11char_traitsIwESaIwEEC1EjwRKS1_"); // std::basic_string<wchar_t, std::char_traits<wchar_t>, std::allocator<wchar_t> >::basic_string(unsigned long, wchar_t, std::allocator<wchar_t> const&)
 extern char cxx_14 __asm__("_ZNSbIwSt11char_traitsIwESaIwEED1Ev"); // std::basic_string<wchar_t, std::char_traits<wchar_t>, std::allocator<wchar_t> >::~basic_string()
 extern char cxx_15 __asm__("_ZNSi10_M_extractImEERSiRT_"); // std::basic_istream<char, std::char_traits<char> >& std::basic_istream<char, std::char_traits<char> >::_M_extract<unsigned long>(unsigned long&)
-extern char cxx_16 __asm__("_ZNSo9_M_insertIdEERSoT_"); // std::basic_ostream<char, std::char_traits<char> >& std::basic_ostream<char, std::char_traits<char> >::_M_insert<double>(double)
+extern void *sfp_ostream_insert_d(void *, unsigned int, unsigned int);
+extern void *sfp_wostream_insert_d(void *, unsigned int, unsigned int);
 extern char cxx_17 __asm__("_ZNSo9_M_insertImEERSoT_"); // std::basic_ostream<char, std::char_traits<char> >& std::basic_ostream<char, std::char_traits<char> >::_M_insert<unsigned long>(unsigned long)
 extern char cxx_18 __asm__("_ZNSolsEi"); // std::basic_ostream<char, std::char_traits<char> >::operator<<(int)
 extern char cxx_19 __asm__("_ZNSs12_M_leak_hardEv"); // std::basic_string<char, std::char_traits<char>, std::allocator<char> >::_M_leak_hard()
@@ -38,7 +39,6 @@ extern char cxx_30 __asm__("_ZNSsC1EPKcRKSaIcE"); // std::basic_string<char, std
 extern char cxx_31 __asm__("_ZNSsC1ERKSs"); // std::basic_string<char, std::char_traits<char>, std::allocator<char> >::basic_string(std::basic_string<char, std::char_traits<char>, std::allocator<char> > const&)
 extern char cxx_32 __asm__("_ZNSsD1Ev"); // std::basic_string<char, std::char_traits<char>, std::allocator<char> >::~basic_string()
 extern char cxx_33 __asm__("_ZNSsD2Ev"); // std::basic_string<char, std::char_traits<char>, std::allocator<char> >::~basic_string()
-extern char cxx_34 __asm__("_ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertIdEERS2_T_"); // std::basic_ostream<wchar_t, std::char_traits<wchar_t> >& std::basic_ostream<wchar_t, std::char_traits<wchar_t> >::_M_insert<double>(double)
 extern char cxx_35 __asm__("_ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertIlEERS2_T_"); // std::basic_ostream<wchar_t, std::char_traits<wchar_t> >& std::basic_ostream<wchar_t, std::char_traits<wchar_t> >::_M_insert<long>(long)
 extern char cxx_36 __asm__("_ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertImEERS2_T_"); // std::basic_ostream<wchar_t, std::char_traits<wchar_t> >& std::basic_ostream<wchar_t, std::char_traits<wchar_t> >::_M_insert<unsigned long>(unsigned long)
 extern char cxx_37 __asm__("_ZNSt13basic_ostreamIwSt11char_traitsIwEElsEi"); // std::basic_ostream<wchar_t, std::char_traits<wchar_t> >::operator<<(int)
@@ -92,7 +92,7 @@ const import_entry cxx_imports[] = {
     {"__ZNSbIwSt11char_traitsIwESaIwEEC1EmwRKS1_", (uintptr_t)&cxx_13, 0},
     {"__ZNSbIwSt11char_traitsIwESaIwEED1Ev", (uintptr_t)&cxx_14, 0},
     {"__ZNSi10_M_extractImEERSiRT_", (uintptr_t)&cxx_15, 0},
-    {"__ZNSo9_M_insertIdEERSoT_", (uintptr_t)&cxx_16, 0},
+    {"__ZNSo9_M_insertIdEERSoT_", (uintptr_t)sfp_ostream_insert_d, 0},
     {"__ZNSo9_M_insertImEERSoT_", (uintptr_t)&cxx_17, 0},
     {"__ZNSolsEi", (uintptr_t)&cxx_18, 0},
     {"__ZNSs12_M_leak_hardEv", (uintptr_t)&cxx_19, 0},
@@ -110,7 +110,7 @@ const import_entry cxx_imports[] = {
     {"__ZNSsC1ERKSs", (uintptr_t)&cxx_31, 0},
     {"__ZNSsD1Ev", (uintptr_t)&cxx_32, 0},
     {"__ZNSsD2Ev", (uintptr_t)&cxx_33, 0},
-    {"__ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertIdEERS2_T_", (uintptr_t)&cxx_34, 0},
+    {"__ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertIdEERS2_T_", (uintptr_t)sfp_wostream_insert_d, 0},
     {"__ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertIlEERS2_T_", (uintptr_t)&cxx_35, 0},
     {"__ZNSt13basic_ostreamIwSt11char_traitsIwEE9_M_insertImEERS2_T_", (uintptr_t)&cxx_36, 0},
     {"__ZNSt13basic_ostreamIwSt11char_traitsIwEElsEi", (uintptr_t)&cxx_37, 0},

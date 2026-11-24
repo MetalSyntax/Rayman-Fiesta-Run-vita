@@ -437,18 +437,8 @@ typedef struct {
     int n, cap;
     int marks[256], depth;
 } ar_pool;
-static pthread_key_t pool_key;
-static pthread_once_t pool_once = PTHREAD_ONCE_INIT;
-static void pool_key_init(void) { pthread_key_create(&pool_key, NULL); }
-static ar_pool *cur_pool(void) {
-    pthread_once(&pool_once, pool_key_init);
-    ar_pool *p = pthread_getspecific(pool_key);
-    if (!p) {
-        p = calloc(1, sizeof(*p));
-        pthread_setspecific(pool_key, p);
-    }
-    return p;
-}
+static __thread ar_pool tls_pool;
+static inline ar_pool *cur_pool(void) { return &tls_pool; }
 
 id objc_autorelease(id o) {
     if (!o || !has_hdr(o))

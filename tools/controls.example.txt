@@ -1,8 +1,19 @@
-# Botón -> toque en la pantalla, en coordenadas de lo que se ve (480x320 si el juego es apaisado,
-# 320x480 si es vertical; origen arriba a la izquierda). Máximo 6 líneas. Se edita por FTP en
-# ux0:data/<slug>/controls.txt sin recompilar. El stick izquierdo es el acelerómetro (inclinación).
-# SELECT+START sostenidos 2 s cambian la rotación de la imagen (se guarda en rotation.txt).
-CROSS 430 270
-CIRCLE 50 270
-SQUARE 430 50
-START 240 160
+# Boton -> toque en pantalla en coordenadas 1136x640 (origen 0,0 = esquina superior izquierda).
+# X: 0 = izquierda, 568 = centro, 1136 = derecha
+# Y: 0 = arriba,    320 = centro,  640 = abajo
+# Maximo 6 botones. Se edita por FTP en ux0:raymanfiesta/controls.txt sin recompilar.
+# Botones validos: CROSS, CIRCLE, SQUARE, TRIANGLE, LTRIGGER, RTRIGGER, START, SELECT, UP, DOWN, LEFT, RIGHT.
+# LOGS 0 = desactiva logs de PERF y touch (recomendado); LOGS 1 = los activa en raymanfiesta.log.
+LOGS 0
+
+# Saltar / planear (zona derecha)
+CROSS 900 480
+RTRIGGER 900 480
+
+# Golpear / punetazo (zona izquierda)
+SQUARE 220 480
+CIRCLE 220 480
+LTRIGGER 220 480
+
+# Pausa (esquina superior derecha)
+START 1080 53

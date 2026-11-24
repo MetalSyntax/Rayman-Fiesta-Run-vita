@@ -55,51 +55,32 @@ static GLuint bound_array_buffer, bound_element_buffer;
 
 static uint32_t draw_calls;
 uint32_t gles_get_draw_calls(void) { return draw_calls; }
-// Perfil por categoría (us), para la línea "vivo:": draws, buffers, texturas.
+// Perfil por categoría (us), para la línea "vivo:" y desglose de cuellos de botella.
 static uint64_t prof_us[3];
+static uint32_t prof_buf_calls, prof_buf_bytes, prof_draw_elems, prof_draw_arrs, prof_verts;
 #define PROF_T0 uint64_t prof_t0 = sceKernelGetProcessTimeWide()
 #define PROF_T1(k) (prof_us[k] += sceKernelGetProcessTimeWide() - prof_t0)
 void gles_take_prof(uint32_t ms[3]) {
     for (int i = 0; i < 3; i++)
         ms[i] = prof_us[i] / 1000, prof_us[i] = 0;
 }
+void gles_take_prof_ext(uint32_t out[8]) {
+    for (int i = 0; i < 3; i++)
+        out[i] = prof_us[i] / 1000, prof_us[i] = 0;
+    out[3] = prof_buf_calls;
+    out[4] = prof_buf_bytes / 1024;
+    out[5] = prof_draw_elems;
+    out[6] = prof_draw_arrs;
+    out[7] = prof_verts / 1000;
+    prof_buf_calls = prof_buf_bytes = prof_draw_elems = prof_draw_arrs = prof_verts = 0;
+}
 
-// Copias en CPU de los VBO (para convertir GL_FIXED y para índices en glDrawElements).
-#define MAX_VBO 4096
-static struct {
-    GLuint id;
-    void *data;
-    int size;
-} vbo_copy[MAX_VBO];
-// Tabla hash con sondeo lineal (antes búsqueda lineal de 4096 por llamada: ~2 s de cada 10 en el mapa).
-#define VBO_DEAD 0xFFFFFFFFu // lápida de un borrado
-static int vbo_slot(GLuint id, int create) {
-    int dead = -1;
-    for (uint32_t n = 0, i = (id * 2654435761u) >> 20; n < MAX_VBO; n++, i = (i + 1) & (MAX_VBO - 1)) {
-        if (vbo_copy[i].id == id)
-            return i;
-        if (vbo_copy[i].id == VBO_DEAD && dead < 0)
-            dead = i;
-        if (!vbo_copy[i].id)
-            return create ? (dead >= 0 ? dead : (int)i) : -1;
-    }
-    return create ? dead : -1;
-}
-static void *vbo_data(GLuint id) {
-    int i = id ? vbo_slot(id, 0) : -1;
-    return i < 0 ? NULL : vbo_copy[i].data;
-}
+// En vitaGL un buffer GLuint id es un puntero vbo* cuyo primer campo es void *ptr (memoria mapeada).
+static void *vbo_data(GLuint id) { return id ? *(void **)(uintptr_t)id : NULL; }
 static void g_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
     PROF_T0;
-    GLuint id = target == GL_ARRAY_BUFFER ? bound_array_buffer : bound_element_buffer;
-    int free_slot = id ? vbo_slot(id, 1) : -1;
-    if (free_slot >= 0) {
-        vbo_copy[free_slot].id = id;
-        vbo_copy[free_slot].data = realloc(vbo_copy[free_slot].data, size);
-        vbo_copy[free_slot].size = size;
-        if (data)
-            memcpy(vbo_copy[free_slot].data, data, size);
-    }
+    prof_buf_calls++;
+    prof_buf_bytes += (uint32_t)size;
     glBufferData(target, size, data, usage);
     PROF_T1(1);
 }
@@ -119,10 +100,8 @@ static void g_glTexSubImage2D(GLenum t, GLint lv, GLint x, GLint y, GLsizei w, G
 }
 static void g_glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const void *data) {
     PROF_T0;
-    GLuint id = target == GL_ARRAY_BUFFER ? bound_array_buffer : bound_element_buffer;
-    int i = id ? vbo_slot(id, 0) : -1;
-    if (i >= 0 && off + size <= vbo_copy[i].size)
-        memcpy((uint8_t *)vbo_copy[i].data + off, data, size);
+    prof_buf_calls++;
+    prof_buf_bytes += (uint32_t)size;
     glBufferSubData(target, off, size, data);
     PROF_T1(1);
 }
@@ -134,15 +113,6 @@ static void g_glBindBuffer(GLenum target, GLuint id) {
     glBindBuffer(target, id);
 }
 static void g_glDeleteBuffers(GLsizei n, const GLuint *ids) {
-    for (int k = 0; k < n; k++) {
-        int i = ids[k] ? vbo_slot(ids[k], 0) : -1;
-        if (i >= 0) {
-            free(vbo_copy[i].data);
-            vbo_copy[i].data = NULL;
-            vbo_copy[i].size = 0;
-            vbo_copy[i].id = VBO_DEAD;
-        }
-    }
     glDeleteBuffers(n, ids);
 }
 
@@ -209,21 +179,34 @@ static void set_pointer(int k, int n) {
         glBindBuffer(GL_ARRAY_BUFFER, bound_array_buffer);
 }
 
+static uint32_t fixed_mask;
+static inline void update_fixed_mask(int k, GLenum type) {
+    if (type == GL_FIXED)
+        fixed_mask |= 1u << k;
+    else
+        fixed_mask &= ~(1u << k);
+}
+
 static void g_glVertexPointer(GLint size, GLenum type, GLsizei stride, const void *ptr) {
     arr[A_VTX] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
+    update_fixed_mask(A_VTX, type);
     set_pointer(A_VTX, 0);
 }
 static void g_glNormalPointer(GLenum type, GLsizei stride, const void *ptr) {
     arr[A_NRM] = (array_ptr){3, type, stride, ptr, bound_array_buffer};
+    update_fixed_mask(A_NRM, type);
     set_pointer(A_NRM, 0);
 }
 static void g_glColorPointer(GLint size, GLenum type, GLsizei stride, const void *ptr) {
     arr[A_COL] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
+    update_fixed_mask(A_COL, type);
     set_pointer(A_COL, 0);
 }
 static void g_glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const void *ptr) {
-    arr[A_TC0 + client_unit] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
-    set_pointer(A_TC0 + client_unit, 0);
+    int k = A_TC0 + client_unit;
+    arr[k] = (array_ptr){size, type, stride, ptr, bound_array_buffer};
+    update_fixed_mask(k, type);
+    set_pointer(k, 0);
 }
 static void g_glClientActiveTexture(GLenum unit) {
     client_unit = (unit - GL_TEXTURE0) & 1;
@@ -231,6 +214,8 @@ static void g_glClientActiveTexture(GLenum unit) {
 }
 
 static void convert_fixed(int n) {
+    if (!fixed_mask)
+        return;
     for (int k = 0; k < A_N; k++)
         if (arr[k].size && arr[k].type == GL_FIXED)
             set_pointer(k, n);
@@ -249,7 +234,10 @@ static GLuint cur_fb;
 static void g_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     PROF_T0;
     draw_calls++;
-    convert_fixed(first + count);
+    prof_draw_arrs++;
+    prof_verts += (uint32_t)count;
+    if (__builtin_expect(fixed_mask != 0, 0))
+        convert_fixed(first + count);
     int skinned = skin(first + count);
     glDrawArrays(mode, first, count);
     if (skinned)
@@ -260,12 +248,12 @@ static void g_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 static void g_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void *idx) {
     PROF_T0;
     draw_calls++;
+    prof_draw_elems++;
+    prof_verts += (uint32_t)count;
     extern int palette_active(void);
-    int need_fixed = palette_active();
-    for (int k = 0; k < A_N; k++)
-        need_fixed |= arr[k].size && arr[k].type == GL_FIXED;
+    int need_fixed = (fixed_mask != 0) | palette_active();
     int maxi = 0;
-    if (need_fixed) {
+    if (__builtin_expect(need_fixed, 0)) {
         const void *ip = bound_element_buffer ? (const uint8_t *)vbo_data(bound_element_buffer) + (uintptr_t)idx : idx;
         for (int i = 0; ip && i < count; i++) {
             int v = type == GL_UNSIGNED_BYTE ? ((const uint8_t *)ip)[i] : ((const uint16_t *)ip)[i];
@@ -440,7 +428,8 @@ static void g_glRotatef(GLfloat a, GLfloat x, GLfloat y, GLfloat z) {
     if (l == 0)
         return;
     x /= l, y /= l, z /= l;
-    float c = cosf(a * 3.14159265f / 180), s_ = sinf(a * 3.14159265f / 180), k = 1 - c;
+    extern float sfp_cosf(float), sfp_sinf(float);
+    float c = sfp_cosf(a * 3.14159265f / 180), s_ = sfp_sinf(a * 3.14159265f / 180), k = 1 - c;
     const float t[16] = {x * x * k + c,     y * x * k + z * s_, x * z * k - y * s_, 0, x * y * k - z * s_, y * y * k + c,
                          y * z * k + x * s_, 0, x * z * k + y * s_, y * z * k - x * s_, z * z * k + c, 0, 0, 0, 0, 1};
     pal_mult(t);
@@ -728,7 +717,7 @@ void gles_set_size(int w, int h) {
 }
 
 void gles_init(void) {
-    vglUseTripleBuffering(GL_FALSE);
+    vglUseTripleBuffering(GL_TRUE);
     vglInitExtended(0, SCR_W, SCR_H, GLES_POOL_MB * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
     gles_set_size(fb_w, fb_h);
 }
