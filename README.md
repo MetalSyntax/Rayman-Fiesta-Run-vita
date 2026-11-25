@@ -20,6 +20,8 @@ An unofficial, native **iOS-to-PS Vita wrapper port** of *Rayman Fiesta Run* (or
 
 **Status: PLAYABLE (BETA v0.1) (v01.00)**
 
+Release: [Beta Release v0.1](https://github.com/MetalSyntax/Rayman-Fiesta-Run-vita/releases/tag/v0.1) · release notes in [RELEASE.md](RELEASE.md).
+
 The game boots, reaches the main menu and the world map, and plays levels on physical PlayStation Vita hardware with music, touch and working saves. The world map runs at about 19 FPS and the first load before the menu is long (see [Known Issues](#known-issues)).
 
 - [x] **Mach-O loader & ObjC runtime**: maps the armv7 PIE image at `0x98000000`, applies 62150 rebase words, binds 6388 import slots (862 symbols, 1 import left unimplemented), registers 231 game classes / 6 categories / 2870 selector refs, and runs 97 static initializers. *Verified on console.*
